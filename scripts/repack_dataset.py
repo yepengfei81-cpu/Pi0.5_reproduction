@@ -1,61 +1,42 @@
-"""在服务器上重新打包 LeRobot 数据集，确保与 openpi 的 datasets 版本兼容"""
-import shutil
-from pathlib import Path
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+"""直接用 pyarrow 修复 parquet 文件中 'List' -> 'Sequence' 的兼容性问题"""
 import json
-import numpy as np
-from PIL import Image
+from pathlib import Path
+import pyarrow.parquet as pq
 
-SRC_DIR = Path("/root/autodl-tmp/data/airbot_play_data")
-DST_DIR = Path("/root/autodl-tmp/data/airbot_play_data_new")
+DATA_DIR = Path("/root/autodl-tmp/data/airbot_play_data")
 
-# 读取原始数据集的 info
-with open(SRC_DIR / "meta" / "info.json") as f:
-    info = json.load(f)
+parquet_files = sorted(DATA_DIR.rglob("*.parquet"))
+print(f"找到 {len(parquet_files)} 个 parquet 文件")
 
-fps = info["fps"]
-num_episodes = info["total_episodes"]
+fixed_count = 0
+for pf in parquet_files:
+    table = pq.read_table(pf)
+    metadata = table.schema.metadata
+    if metadata is None:
+        print(f"  跳过 (无 metadata): {pf}")
+        continue
 
-# 加载原始数据集
-src = LeRobotDataset("airbot_play_data", root=SRC_DIR)
+    new_metadata = {}
+    changed = False
+    for k, v in metadata.items():
+        k_str = k.decode("utf-8") if isinstance(k, bytes) else k
+        v_str = v.decode("utf-8") if isinstance(v, bytes) else v
 
-# 创建新数据集
-if DST_DIR.exists():
-    shutil.rmtree(DST_DIR)
+        if '"_type": "List"' in v_str:
+            v_str = v_str.replace('"_type": "List"', '"_type": "Sequence"')
+            changed = True
 
-dst = LeRobotDataset.create(
-    repo_id="airbot_play_data",
-    robot_type="airbot_play",
-    fps=fps,
-    root=DST_DIR,
-    features={
-        "image": {"dtype": "image", "shape": (480, 640, 3), "names": ["height", "width", "channel"]},
-        "wrist_image": {"dtype": "image", "shape": (480, 640, 3), "names": ["height", "width", "channel"]},
-        "state": {"dtype": "float32", "shape": (7,), "names": ["state"]},
-        "actions": {"dtype": "float32", "shape": (7,), "names": ["actions"]},
-    },
-    image_writer_threads=4,
-    image_writer_processes=2,
-)
+        new_metadata[k if isinstance(k, bytes) else k.encode("utf-8")] = (
+            v_str.encode("utf-8") if isinstance(v, bytes) else v_str
+        )
 
-# 逐 episode 复制数据
-for ep_idx in range(num_episodes):
-    ep_data = src.hf_dataset.filter(lambda x: x["episode_index"] == ep_idx)
-    for i in range(len(ep_data)):
-        row = ep_data[i]
-        dst.add_frame({
-            "image": np.array(row["image"]),
-            "wrist_image": np.array(row["wrist_image"]),
-            "state": np.array(row["state"], dtype=np.float32),
-            "actions": np.array(row["actions"], dtype=np.float32),
-            "task": src.meta.tasks[row["task_index"]],
-        })
-    dst.save_episode()
-    print(f"Episode {ep_idx + 1}/{num_episodes} done")
+    if changed:
+        new_schema = table.schema.with_metadata(new_metadata)
+        new_table = table.replace_schema_metadata(new_metadata)
+        pq.write_table(new_table, pf)
+        fixed_count += 1
+        print(f"  已修复: {pf.relative_to(DATA_DIR)}")
+    else:
+        print(f"  无需修改: {pf.relative_to(DATA_DIR)}")
 
-print(f"新数据集已保存到: {DST_DIR}")
-
-# 替换
-shutil.rmtree(SRC_DIR)
-DST_DIR.rename(SRC_DIR)
-print("已替换原数据集")
+print(f"\n完成！共修复 {fixed_count} 个文件")
