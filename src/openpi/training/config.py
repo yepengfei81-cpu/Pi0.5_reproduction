@@ -978,7 +978,12 @@ _CONFIGS = [
     #
     TrainConfig(
         name="pi05_airbot_play",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
         data=LeRobotAirbotPlayDataConfig(
             repo_id="airbot_play_data",
             base_config=DataConfig(prompt_from_task=True),
@@ -986,7 +991,14 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
         batch_size=32,
-    ), 
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # LoRA 不需要 EMA
+        ema_decay=None,
+    ),
     #
     # Debugging configs.
     #
