@@ -1,323 +1,235 @@
-# openpi
+# AirBot Play × openpi (π0.5) 复现与部署指南
 
-openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
+本仓库基于 [openpi](https://github.com/Physical-Intelligence/openpi) 复现 **π0.5 (pi05)** 视觉-语言-动作模型，并适配 **AIRBOT Play** 机械臂：从遥操作采集真机数据 → 服务器训练 → 本地实时推理，完整跑通。
 
-Currently, this repo contains three types of models:
-- the [π₀ model](https://www.physicalintelligence.company/blog/pi0), a flow-based vision-language-action model (VLA).
-- the [π₀-FAST model](https://www.physicalintelligence.company/research/fast), an autoregressive VLA, based on the FAST action tokenizer.
-- the [π₀.₅ model](https://www.physicalintelligence.company/blog/pi05), an upgraded version of π₀ with better open-world generalization trained with [knowledge insulation](https://www.physicalintelligence.company/research/knowledge_insulation). Note that, in this repository, we currently only support the flow matching head for both $\pi_{0.5}$ training and inference.
+> openpi 上游的原始英文文档见 [README_openpi.md](README_openpi.md)。
 
-For all models, we provide _base model_ checkpoints, pre-trained on 10k+ hours of robot data, and examples for using them out of the box or fine-tuning them to your own datasets.
+---
 
-This is an experiment: $\pi_0$ was developed for our own robots, which differ from the widely used platforms such as [ALOHA](https://tonyzhaozh.github.io/aloha/) and [DROID](https://droid-dataset.github.io/), and though we are optimistic that researchers and practitioners will be able to run creative new experiments adapting $\pi_0$ to their own platforms, we do not expect every such attempt to be successful. All this is to say: $\pi_0$ may or may not work for you, but you are welcome to try it and see!
+## 0. 总览
 
-## Updates
-
-- [Sept 2025] We released PyTorch support in openpi.
-- [Sept 2025] We released pi05, an upgraded version of pi0 with better open-world generalization.
-- [Sept 2025]: We have added an [improved idle filter](examples/droid/README_train.md#data-filtering) for DROID training.
-- [Jun 2025]: We have added [instructions](examples/droid/README_train.md) for using `openpi` to train VLAs on the full [DROID dataset](https://droid-dataset.github.io/). This is an approximate open-source implementation of the training pipeline used to train pi0-FAST-DROID. 
-
-
-## Requirements
-
-To run the models in this repository, you will need an NVIDIA GPU with at least the following specifications. These estimations assume a single GPU, but you can also use multiple GPUs with model parallelism to reduce per-GPU memory requirements by configuring `fsdp_devices` in the training config. Please also note that the current training script does not yet support multi-node training.
-
-| Mode               | Memory Required | Example GPU        |
-| ------------------ | --------------- | ------------------ |
-| Inference          | > 8 GB          | RTX 4090           |
-| Fine-Tuning (LoRA) | > 22.5 GB       | RTX 4090           |
-| Fine-Tuning (Full) | > 70 GB         | A100 (80GB) / H100 |
-
-The repo has been tested with Ubuntu 22.04, we do not currently support other operating systems.
-
-## Installation
-
-When cloning this repo, make sure to update submodules:
-
-```bash
-git clone --recurse-submodules git@github.com:Physical-Intelligence/openpi.git
-
-# Or if you already cloned the repo:
-git submodule update --init --recursive
+### 整套流程
+```
+[本地工作站]  遥操作采集数据 (collect_data.py)
+      │  上传数据集到 HuggingFace
+      ▼
+[训练服务器]  repack → 算 norm_stats → 训练 (train.py)
+      │  上传权重到 HuggingFace
+      ▼
+[本地工作站]  下载权重 → 实时推理 (local_inference.py)
 ```
 
-We use [uv](https://docs.astral.sh/uv/) to manage Python dependencies. See the [uv installation instructions](https://docs.astral.sh/uv/getting-started/installation/) to set it up. Once uv is installed, run the following to set up the environment:
+### 两类机器、两套环境
+| 机器 | 环境工具 | 用途 |
+|------|----------|------|
+| **本地工作站**（接机械臂+相机+GPU） | **conda**（方案 A，一锅端） | 采集数据、本地推理 |
+| **训练服务器**（大显存 GPU，无机械臂） | **uv** | 训练 |
+
+> 为什么本地用 conda、服务器用 uv：本地推理脚本要在**同一进程**里同时加载 openpi 模型和机械臂 SDK，conda 一个环境装全最省事；服务器只跑训练，用 openpi 官方推荐的 uv 最干净。
+
+### 硬件（本套配置，换硬件需相应修改）
+- **机械臂 ×2**：Lead（Replay 无动力主臂，gRPC 端口 `50051`）+ Follow（Play 有动力从臂，端口 `50050`）
+- **相机 ×2**：RealSense D405
+  - head（环境相机）SN `230422271972`
+  - wrist（手眼相机）SN `230422271433`
+- **GPU**：推理 ≥8GB；LoRA 微调 ≥22.5GB（详见 [README_openpi.md](README_openpi.md)）
+- **系统**：Ubuntu 20.04+
+
+> 相机序列号在 [airbot/play_config.json](airbot/play_config.json) 和 [airbot/collect_data.py](airbot/collect_data.py) 里，换相机改这两处。
+
+---
+
+## 1. 机械臂 & 相机环境（系统级，仅真机端需要）
+
+> 这一步配置 AIRBOT Play 的驱动和 SDK，是采集/推理的前提。**只在接了机械臂的本地工作站上做**，训练服务器不需要。
+
+### 1.1 获取厂家软件包
+`airbot-configure`（驱动 .deb）和 `airbot_py`（Python SDK .whl）是 **AIRBOT 专有软件**，不在本仓库内（专有软件不便随 MIT 仓库分发）。
+
+Ubuntu + 纯 Python 使用，**只需以下两个文件**：
+
+| 文件 | 用途 |
+|------|------|
+| `airbot-configure_5.1.6-1_all.deb` | 驱动（配置 CAN/udev），架构无关 |
+| `airbot_py-5.1.6-py3-none-any.whl` | Python SDK |
+
+> `airbot_cpp-*.deb`（C++ SDK）本项目用不到，无需获取。
+
+获取方式：
+- **官方途径**：联系 AIRBOT 技术支持获取（不同固件版本配套的驱动不同，务必拿对应版本）；
+- **本实验室成员**：从云盘下载 → **📦 下载链接（待填）：`<在此粘贴 Google Drive 链接>`**
+
+### 1.2 安装驱动（配置 CAN 接口 / udev 规则）
+```bash
+sudo apt-get install ./airbot-configure_5.1.6-1_all.deb
+dpkg -l | grep airbot          # 看到版本号即成功
+```
+
+### 1.3 安装 Python SDK（在第 2 步建好的 conda 环境里装）
+```bash
+pip install ./airbot_py-5.1.6-py3-none-any.whl
+python -c "import airbot_py; print('airbot_py OK')"
+```
+
+### 1.4 相机库
+```bash
+pip install pyrealsense2
+```
+
+> 机械臂封装 [airbot/play_sdk.py](airbot/play_sdk.py) 已包含在本仓库里，无需单独安装。
+
+---
+
+## 2. 本地环境（conda，方案 A）—— 采集 + 推理
+
+> 一个 conda 环境装下 openpi + 机械臂 SDK + 相机，`collect_data.py` 和 `local_inference.py` 都在这里跑。
 
 ```bash
+# 拉代码（务必带子模块）
+git clone --recurse-submodules <本仓库地址> Pi0.5_reproduction
+cd Pi0.5_reproduction
+
+# 新建 conda 环境（python 3.11，openpi 要求 ≥3.11）
+conda create -n openpi_airbot python=3.11 -y
+conda activate openpi_airbot
+
+# 安装 openpi 全家桶
+pip install -e packages/openpi-client
+pip install "lerobot @ git+https://github.com/huggingface/lerobot@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5"
+pip install -e .
+
+# 安装机械臂 SDK + 相机（见第 1 章）
+pip install ./airbot_py-5.1.6-py3-none-any.whl
+pip install pyrealsense2
+```
+
+> 系统级 NVIDIA 驱动 / CUDA 需自行装好，`nvidia-smi` 能正常输出即可。
+
+---
+
+## 3. 服务器训练环境（uv）
+
+> 训练服务器不接机械臂，只需 openpi。用 uv 安装。
+
+```bash
+# 安装 uv（装在 conda 之外，全局可用；不要 pip install 进 conda 环境）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 拉代码
+git clone --recurse-submodules <本仓库地址> Pi0.5_reproduction
+cd Pi0.5_reproduction
+
+# uv 按 uv.lock 装好 openpi + jax + torch 等全部依赖到项目本地 .venv
 GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 ```
+后续训练命令统一用 `uv run python ...`。
 
-NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.
+---
 
-**Docker**: As an alternative to uv installation, we provide instructions for installing openpi using Docker. If you encounter issues with your system setup, consider using Docker to simplify installation. See [Docker Setup](docs/docker.md) for more details.
+## 4. 数据集 & 权重（HuggingFace）
 
+数据集（约数 GB）和微调权重（约 9GB）**不进 git**，通过 HuggingFace 分发。
 
+### 4.1 仓库地址（建好后填写）
+- 数据集：`<待填：你的HF用户名>/airbot_play_data`
+- 权重：  `<待填：你的HF用户名>/pi05_airbot_play`
 
+### 4.2 上传（数据/权重的产出方执行）
+```bash
+huggingface-cli login          # 用 Write 权限的 token
 
-## Model Checkpoints
-
-### Base Models
-We provide multiple base VLA model checkpoints. These checkpoints have been pre-trained on 10k+ hours of robot data, and can be used for fine-tuning.
-
-| Model        | Use Case    | Description                                                                                                 | Checkpoint Path                                |
-| ------------ | ----------- | ----------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| $\pi_0$      | Fine-Tuning | Base [π₀ model](https://www.physicalintelligence.company/blog/pi0) for fine-tuning                | `gs://openpi-assets/checkpoints/pi0_base`      |
-| $\pi_0$-FAST | Fine-Tuning | Base autoregressive [π₀-FAST model](https://www.physicalintelligence.company/research/fast) for fine-tuning | `gs://openpi-assets/checkpoints/pi0_fast_base` |
-| $\pi_{0.5}$    | Fine-Tuning | Base [π₀.₅ model](https://www.physicalintelligence.company/blog/pi05) for fine-tuning    | `gs://openpi-assets/checkpoints/pi05_base`      |
-
-### Fine-Tuned Models
-We also provide "expert" checkpoints for various robot platforms and tasks. These models are fine-tuned from the base models above and intended to run directly on the target robot. These may or may not work on your particular robot. Since these checkpoints were fine-tuned on relatively small datasets collected with more widely available robots, such as ALOHA and the DROID Franka setup, they might not generalize to your particular setup, though we found some of these, especially the DROID checkpoint, to generalize quite broadly in practice.
-
-| Model                    | Use Case    | Description                                                                                                                                                                                              | Checkpoint Path                                       |
-| ------------------------ | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| $\pi_0$-FAST-DROID       | Inference   | $\pi_0$-FAST model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/): can perform a wide range of simple table-top manipulation tasks 0-shot in new scenes on the DROID robot platform | `gs://openpi-assets/checkpoints/pi0_fast_droid`       |
-| $\pi_0$-DROID            | Fine-Tuning | $\pi_0$ model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/): faster inference than $\pi_0$-FAST-DROID, but may not follow language commands as well                                | `gs://openpi-assets/checkpoints/pi0_droid`            |
-| $\pi_0$-ALOHA-towel      | Inference   | $\pi_0$ model fine-tuned on internal [ALOHA](https://tonyzhaozh.github.io/aloha/) data: can fold diverse towels 0-shot on ALOHA robot platforms                                                          | `gs://openpi-assets/checkpoints/pi0_aloha_towel`      |
-| $\pi_0$-ALOHA-tupperware | Inference   | $\pi_0$ model fine-tuned on internal [ALOHA](https://tonyzhaozh.github.io/aloha/) data: can unpack food from a tupperware container                                                                                                             | `gs://openpi-assets/checkpoints/pi0_aloha_tupperware` |
-| $\pi_0$-ALOHA-pen-uncap  | Inference   | $\pi_0$ model fine-tuned on public [ALOHA](https://dit-policy.github.io/) data: can uncap a pen                                                                                                          | `gs://openpi-assets/checkpoints/pi0_aloha_pen_uncap`  |
-| $\pi_{0.5}$-LIBERO      | Inference   | $\pi_{0.5}$ model fine-tuned for the [LIBERO](https://libero-project.github.io/datasets) benchmark: gets state-of-the-art performance (see [LIBERO README](examples/libero/README.md)) | `gs://openpi-assets/checkpoints/pi05_libero`      |
-| $\pi_{0.5}$-DROID      | Inference / Fine-Tuning | $\pi_{0.5}$ model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/) with [knowledge insulation](https://www.physicalintelligence.company/research/knowledge_insulation): fast inference and good language-following | `gs://openpi-assets/checkpoints/pi05_droid`      |
-
-
-By default, checkpoints are automatically downloaded from `gs://openpi-assets` and are cached in `~/.cache/openpi` when needed. You can overwrite the download path by setting the `OPENPI_DATA_HOME` environment variable.
-
-
-
-
-## Running Inference for a Pre-Trained Model
-
-Our pre-trained model checkpoints can be run with a few lines of code (here our $\pi_0$-FAST-DROID model):
-```python
-from openpi.training import config as _config
-from openpi.policies import policy_config
-from openpi.shared import download
-
-config = _config.get_config("pi05_droid")
-checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi05_droid")
-
-# Create a trained policy.
-policy = policy_config.create_trained_policy(config, checkpoint_dir)
-
-# Run inference on a dummy example.
-example = {
-    "observation/exterior_image_1_left": ...,
-    "observation/wrist_image_left": ...,
-    ...
-    "prompt": "pick up the fork"
-}
-action_chunk = policy.infer(example)["actions"]
+# 数据集（整个 lerobot 文件夹）
+huggingface-cli upload <用户名>/airbot_play_data "$HF_LEROBOT_HOME/airbot_play_data" . --repo-type dataset
+# 权重（某个 step 的 checkpoint）
+huggingface-cli upload <用户名>/pi05_airbot_play ./checkpoints/pi05_airbot_play/<exp-name>/<step> . --repo-type model
 ```
-You can also test this out in the [example notebook](examples/inference.ipynb).
 
-We provide detailed step-by-step examples for running inference of our pre-trained checkpoints on [DROID](examples/droid/README.md) and [ALOHA](examples/aloha_real/README.md) robots.
+### 4.3 下载
+```bash
+# 服务器下载数据集到 HF_LEROBOT_HOME（见第 5.2 节）
+huggingface-cli download <用户名>/airbot_play_data --repo-type dataset \
+  --local-dir "$HF_LEROBOT_HOME/airbot_play_data"
 
-**Remote Inference**: We provide [examples and code](docs/remote_inference.md) for running inference of our models **remotely**: the model can run on a different server and stream actions to the robot via a websocket connection. This makes it easy to use more powerful GPUs off-robot and keep robot and policy environments separate.
+# 本地下载权重用于推理
+huggingface-cli download <用户名>/pi05_airbot_play --repo-type model \
+  --local-dir ./checkpoints/pi05_airbot_play/my_experiment/16000
+```
 
-**Test inference without a robot**: We provide a [script](examples/simple_client/README.md) for testing inference without a robot. This script will generate a random observation and run inference with the model. See [here](examples/simple_client/README.md) for more details.
+---
 
+## 5. 完整流程
 
+### 5.1 采集数据（本地，conda 环境）
+确保机械臂上电、双臂 gRPC 服务已启动、两台相机已连接，然后：
+```bash
+conda activate openpi_airbot
+python airbot/collect_data.py --task "pick up the block and place it in the bowl"
+```
+- 按 `Enter` 开始录一条 episode，遥操作 Lead 臂演示，再按 `Enter` 保存（`d` 丢弃），`q` 结束并自动存为 LeRobot 格式。
+- 数据保存在 `$HF_LEROBOT_HOME/airbot_play_data`（默认 `~/.cache/huggingface/lerobot/`）。
+- 采完按第 4.2 节上传到 HuggingFace。
 
+### 5.2 训练（服务器，uv 环境）
+```bash
+# 1) 指定数据集根目录（放在大数据盘，避免塞满系统盘）
+mkdir -p /path/to/bigdisk/data
+export HF_LEROBOT_HOME=/path/to/bigdisk/data
+#    然后把数据集放到 $HF_LEROBOT_HOME/airbot_play_data（下载或拷贝）
 
+# 2) 修复 parquet 元数据兼容性（List -> Sequence）
+uv run python scripts/repack_dataset.py        # 自动读取 HF_LEROBOT_HOME
 
-## Fine-Tuning Base Models on Your Own Data
+# 3) 计算归一化统计量
+uv run scripts/compute_norm_stats.py --config-name pi05_airbot_play
 
-We will fine-tune the $\pi_{0.5}$ model on the [LIBERO dataset](https://libero-project.github.io/datasets) as a running example for how to fine-tune a base model on your own data. We will explain three steps:
-1. Convert your data to a LeRobot dataset (which we use for training)
-2. Defining training configs and running training
-3. Spinning up a policy server and running inference
+# 4) 训练（LoRA 微调，配置见 src/openpi/training/config.py 的 pi05_airbot_play）
+uv run scripts/train.py pi05_airbot_play --exp-name=test_run --num-train-steps=30000 --batch-size=8
+```
+- 训练基础权重 `pi05_base` 会自动从 `gs://openpi-assets` 下载（需联网）。
+- 输出权重在 `checkpoints/pi05_airbot_play/<exp-name>/<step>/`，含归一化统计 `assets/`。
+- 训练完按第 4.2 节上传权重。
 
-### 1. Convert your data to a LeRobot dataset
+> `HF_LEROBOT_HOME` 是 lerobot 存放数据集的根目录。采集、repack、训练三处都按它定位数据集，所以**训练前必须先 export**。
 
-We provide a minimal example script for converting LIBERO data to a LeRobot dataset in [`examples/libero/convert_libero_data_to_lerobot.py`](examples/libero/convert_libero_data_to_lerobot.py). You can easily modify it to convert your own data! You can download the raw LIBERO dataset from [here](https://huggingface.co/datasets/openvla/modified_libero_rlds), and run the script with:
+### 5.3 推理（本地，conda 环境）
+```bash
+conda activate openpi_airbot
+
+# 先 dry-run：只推理打印、不发运动指令（仍会连机械臂和相机）
+python local_inference.py \
+  --checkpoint ./checkpoints/pi05_airbot_play/my_experiment/16000 \
+  --task "pick up the block and place it in the bowl" \
+  --steps 5 --freq 5 --dry-run
+
+# 确认预测正常后，去掉 --dry-run 真机运行
+python local_inference.py \
+  --checkpoint ./checkpoints/pi05_airbot_play/my_experiment/16000 \
+  --task "pick up the block and place it in the bowl"
+```
+**安全**：有显示窗口时按 `q` / `Esc` 急停并回零位；无窗口时（`--no-display`）在终端输入 `q` 回车急停。`--min-z` 设末端最低高度防止压台面。
+
+---
+
+## 6. 测试后清理
 
 ```bash
-uv run examples/libero/convert_libero_data_to_lerobot.py --data_dir /path/to/your/libero/data
+conda deactivate
+conda env remove -n openpi_airbot          # 删 conda 环境
+rm -rf .venv                               # 删 uv 环境（如有）
+# 模型缓存（跨项目共享，按需清理）：
+du -sh ~/.cache/openpi ~/.cache/huggingface
 ```
 
-**Note:** If you just want to fine-tune on LIBERO, you can skip this step, because our LIBERO fine-tuning configs point to a pre-converted LIBERO dataset. This step is merely an example that you can adapt to your own data.
+---
 
-### 2. Defining training configs and running training
-
-To fine-tune a base model on your own data, you need to define configs for data processing and training. We provide example configs with detailed comments for LIBERO below, which you can modify for your own dataset:
-
-- [`LiberoInputs` and `LiberoOutputs`](src/openpi/policies/libero_policy.py): Defines the data mapping from the LIBERO environment to the model and vice versa. Will be used for both, training and inference.
-- [`LeRobotLiberoDataConfig`](src/openpi/training/config.py): Defines how to process raw LIBERO data from LeRobot dataset for training.
-- [`TrainConfig`](src/openpi/training/config.py): Defines fine-tuning hyperparameters, data config, and weight loader.
-
-We provide example fine-tuning configs for [π₀](src/openpi/training/config.py), [π₀-FAST](src/openpi/training/config.py), and [π₀.₅](src/openpi/training/config.py) on LIBERO data.
-
-Before we can run training, we need to compute the normalization statistics for the training data. Run the script below with the name of your training config:
-
-```bash
-uv run scripts/compute_norm_stats.py --config-name pi05_libero
-```
-
-Now we can kick off training with the following command (the `--overwrite` flag is used to overwrite existing checkpoints if you rerun fine-tuning with the same config):
-
-```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_libero --exp-name=my_experiment --overwrite
-```
-
-The command will log training progress to the console and save checkpoints to the `checkpoints` directory. You can also monitor training progress on the Weights & Biases dashboard. For maximally using the GPU memory, set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` before running training -- this enables JAX to use up to 90% of the GPU memory (vs. the default of 75%).
-
-**Note:** We provide functionality for *reloading* normalization statistics for state / action normalization from pre-training. This can be beneficial if you are fine-tuning to a new task on a robot that was part of our pre-training mixture. For more details on how to reload normalization statistics, see the [norm_stats.md](docs/norm_stats.md) file.
-
-### 3. Spinning up a policy server and running inference
-
-Once training is complete, we can run inference by spinning up a policy server and then querying it from a LIBERO evaluation script. Launching a model server is easy (we use the checkpoint for iteration 20,000 for this example, modify as needed):
-
-```bash
-uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_libero --policy.dir=checkpoints/pi05_libero/my_experiment/20000
-```
-
-This will spin up a server that listens on port 8000 and waits for observations to be sent to it. We can then run an evaluation script (or robot runtime) that queries the server.
-
-For running the LIBERO eval in particular, we provide (and recommend using) a Dockerized workflow that handles both the policy server and the evaluation script together. See the [LIBERO README](examples/libero/README.md) for more details.
-
-If you want to embed a policy server call in your own robot runtime, we have a minimal example of how to do so in the [remote inference docs](docs/remote_inference.md).
-
-
-
-### More Examples
-
-We provide more examples for how to fine-tune and run inference with our models on the ALOHA platform in the following READMEs:
-- [ALOHA Simulator](examples/aloha_sim)
-- [ALOHA Real](examples/aloha_real)
-- [UR5](examples/ur5)
-
-## PyTorch Support
-
-openpi now provides PyTorch implementations of π₀ and π₀.₅ models alongside the original JAX versions! The PyTorch implementation has been validated on the LIBERO benchmark (both inference and finetuning). A few features are currently not supported (this may change in the future):
-
-- The π₀-FAST model
-- Mixed precision training
-- FSDP (fully-sharded data parallelism) training
-- LoRA (low-rank adaptation) training
-- EMA (exponential moving average) weights during training
-
-### Setup
-1. Make sure that you have the latest version of all dependencies installed: `uv sync`
-
-2. Double check that you have transformers 4.53.2 installed: `uv pip show transformers`
-
-3. Apply the transformers library patches:
-   ```bash
-   cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/
-   ```
-
-This overwrites several files in the transformers library with necessary model changes: 1) supporting AdaRMS, 2) correctly controlling the precision of activations, and 3) allowing the KV cache to be used without being updated.
-
-**WARNING**: With the default uv link mode (hardlink), this will permanently affect the transformers library in your uv cache, meaning the changes will survive reinstallations of transformers and could even propagate to other projects that use transformers. To fully undo this operation, you must run `uv cache clean transformers`.
-
-### Converting JAX Models to PyTorch
-
-To convert a JAX model checkpoint to PyTorch format:
-
-```bash
-uv run examples/convert_jax_model_to_pytorch.py \
-    --checkpoint_dir /path/to/jax/checkpoint \
-    --config_name <config name> \
-    --output_path /path/to/converted/pytorch/checkpoint
-```
-
-### Running Inference with PyTorch
-
-The PyTorch implementation uses the same API as the JAX version - you only need to change the checkpoint path to point to the converted PyTorch model:
-
-```python
-from openpi.training import config as _config
-from openpi.policies import policy_config
-from openpi.shared import download
-
-config = _config.get_config("pi05_droid")
-checkpoint_dir = "/path/to/converted/pytorch/checkpoint"
-
-# Create a trained policy (automatically detects PyTorch format)
-policy = policy_config.create_trained_policy(config, checkpoint_dir)
-
-# Run inference (same API as JAX)
-action_chunk = policy.infer(example)["actions"]
-```
-
-### Policy Server with PyTorch
-
-The policy server works identically with PyTorch models - just point to the converted checkpoint directory:
-
-```bash
-uv run scripts/serve_policy.py policy:checkpoint \
-    --policy.config=pi05_droid \
-    --policy.dir=/path/to/converted/pytorch/checkpoint
-```
-
-### Finetuning with PyTorch
-
-To finetune a model in PyTorch:
-
-1. Convert the JAX base model to PyTorch format:
-   ```bash
-   uv run examples/convert_jax_model_to_pytorch.py \
-       --config_name <config name> \
-       --checkpoint_dir /path/to/jax/base/model \
-       --output_path /path/to/pytorch/base/model
-   ```
-
-2. Specify the converted PyTorch model path in your config using `pytorch_weight_path`
-
-3. Launch training using one of these modes:
-
-```bash
-# Single GPU training:
-uv run scripts/train_pytorch.py <config_name> --exp_name <run_name> --save_interval <interval>
-
-# Example:
-uv run scripts/train_pytorch.py debug --exp_name pytorch_test
-uv run scripts/train_pytorch.py debug --exp_name pytorch_test --resume  # Resume from latest checkpoint
-
-# Multi-GPU training (single node):
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=<num_gpus> scripts/train_pytorch.py <config_name> --exp_name <run_name>
-
-# Example:
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test --resume
-
-# Multi-Node Training:
-uv run torchrun \
-    --nnodes=<num_nodes> \
-    --nproc_per_node=<gpus_per_node> \
-    --node_rank=<rank_of_node> \
-    --master_addr=<master_ip> \
-    --master_port=<port> \
-    scripts/train_pytorch.py <config_name> --exp_name=<run_name> --save_interval <interval>
-```
-
-### Precision Settings
-
-JAX and PyTorch implementations handle precision as follows:
-
-**JAX:**
-1. Inference: most weights and computations in bfloat16, with a few computations in float32 for stability
-2. Training: defaults to mixed precision: weights and gradients in float32, (most) activations and computations in bfloat16. You can change to full float32 training by setting `dtype` to float32 in the config.
-
-**PyTorch:**
-1. Inference: matches JAX -- most weights and computations in bfloat16, with a few weights converted to float32 for stability
-2. Training: supports either full bfloat16 (default) or full float32. You can change it by setting `pytorch_training_precision` in the config. bfloat16 uses less memory but exhibits higher losses compared to float32. Mixed precision is not yet supported.
-
-With torch.compile, inference speed is comparable between JAX and PyTorch.
-
-## Troubleshooting
-
-We will collect common issues and their solutions here. If you encounter an issue, please check here first. If you can't find a solution, please file an issue on the repo (see [here](CONTRIBUTING.md) for guidelines).
-
-| Issue                                     | Resolution                                                                                                                                                                                   |
-| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `uv sync` fails with dependency conflicts | Try removing the virtual environment directory (`rm -rf .venv`) and running `uv sync` again. If issues persist, check that you have the latest version of `uv` installed (`uv self update`). |
-| Training runs out of GPU memory           | Make sure you set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` (or higher) before running training to allow JAX to use more GPU memory. You can also use `--fsdp-devices <n>` where `<n>` is your number of GPUs, to enable [fully-sharded data parallelism](https://engineering.fb.com/2021/07/15/open-source/fsdp/), which reduces memory usage in exchange for slower training (the amount of slowdown depends on your particular setup). If you are still running out of memory, you may want to consider disabling EMA.        |
-| Policy server connection errors           | Check that the server is running and listening on the expected port. Verify network connectivity and firewall settings between client and server.                                            |
-| Missing norm stats error when training    | Run `scripts/compute_norm_stats.py` with your config name before starting training.                                                                                                          |
-| Dataset download fails                    | Check your internet connection. For HuggingFace datasets, ensure you're logged in (`huggingface-cli login`).                                                                                 |
-| CUDA/GPU errors                           | Verify NVIDIA drivers are installed correctly. For Docker, ensure nvidia-container-toolkit is installed. Check GPU compatibility. You do NOT need CUDA libraries installed at a system level --- they will be installed via uv. You may even want to try *uninstalling* system CUDA libraries if you run into CUDA issues, since system libraries can sometimes cause conflicts. |
-| Import errors when running examples       | Make sure you've installed all dependencies with `uv sync`. Some examples may have additional requirements listed in their READMEs.                    |
-| Action dimensions mismatch                | Verify your data processing transforms match the expected input/output dimensions of your robot. Check the action space definitions in your policy classes.                                  |
-| Diverging training loss                            | Check the `q01`, `q99`, and `std` values in `norm_stats.json` for your dataset. Certain dimensions that are rarely used can end up with very small `q01`, `q99`, or `std` values, leading to huge states and actions after normalization. You can manually adjust the norm stats as a workaround. |
+## 仓库中本项目新增/修改的关键文件
+| 路径 | 说明 |
+|------|------|
+| [airbot/collect_data.py](airbot/collect_data.py) | 遥操作 + 双相机采集 → LeRobot 数据集 |
+| [airbot/play_sdk.py](airbot/play_sdk.py) | AIRBOT Play 机械臂 + 相机封装 |
+| [airbot/play_config.json](airbot/play_config.json) | 端口 + 相机序列号配置 |
+| [local_inference.py](local_inference.py) | 本地实时推理脚本 |
+| `src/openpi/policies/airbot_play_policy.py` | airbot 数据 ↔ 模型输入输出变换 |
+| `src/openpi/training/config.py` | 训练配置 `pi05_airbot_play` |
+| `scripts/repack_dataset.py` | parquet 元数据兼容性修复 |

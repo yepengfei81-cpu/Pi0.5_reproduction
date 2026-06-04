@@ -4,7 +4,7 @@ AirBot Play 本地实时推理脚本
 
 用法：
   python local_inference.py \
-    --checkpoint ./checkpoints/pi05_airbot_play/test_run/4999 \
+    --checkpoint ./checkpoints/pi05_airbot_play/my_experiment/16000 \
     --task "pick up the block and place it in the bowl"
 
 急停：按 q 或 Esc，机械臂立即停止并回零点
@@ -26,7 +26,8 @@ from openpi.policies import policy_config as _policy_config
 from openpi.training import config as _config
 
 import sys
-sys.path.insert(0, str(pathlib.Path(__file__).parent.parent / "qiuzhiarm_LLM"))
+# play_sdk.py 与本脚本一起放在仓库的 airbot/ 子目录下
+sys.path.insert(0, str(pathlib.Path(__file__).parent / "airbot"))
 from play_sdk import PlayRealRobot, RobotMode, SpeedProfile
 
 logging.basicConfig(level=logging.INFO)
@@ -51,6 +52,8 @@ class AirbotPlayInferenceRunner:
         dry_run: bool = False,
         debug: bool = False,
         no_display: bool = False,
+        min_z_height = None,
+        chunk_execute: int = 5,
     ):
         self.checkpoint_dir = pathlib.Path(checkpoint_dir)
         self.task_prompt = task_prompt or "do something"
@@ -83,7 +86,9 @@ class AirbotPlayInferenceRunner:
         self.last_joint_pos = None
         self.last_gripper_cmd = 0.0
         self.last_sent_gripper = None
-        self.min_gripper_delta = 0.005
+        self.min_gripper_delta = 0.001
+        self.min_z_height = min_z_height
+        self.chunk_execute = chunk_execute
 
         eef = self.robot.left._robot.get_eef_pos()
         if eef is not None and len(eef) > 0:
@@ -209,6 +214,38 @@ class AirbotPlayInferenceRunner:
             return True
         return abs(target_gripper - self.last_sent_gripper) >= self.min_gripper_delta
 
+    def _execute_action(self, exec_step: int, action_row: np.ndarray) -> bool:
+        """执行 chunk 中的单行动作。返回 False 表示急停。"""
+        target_joints = action_row[:6]
+        target_gripper = float(action_row[6])
+
+        # 获取当前关节状态（用于 Z 保护和显示）
+        joint_q = self.robot.get_joint_q()
+        current_state = np.array(
+            list(joint_q) + [self.last_gripper_cmd], dtype=np.float32
+        ) if joint_q is not None else np.zeros(7, dtype=np.float32)
+
+        # Z轴高度保护
+        if self.min_z_height is not None:
+            end_pose = self.robot.left._robot.get_end_pose()
+            if end_pose is not None and end_pose[0][2] < self.min_z_height:
+                logger.warning(
+                    f"Z轴保护[exec]: Z={end_pose[0][2]:.4f} < {self.min_z_height:.4f}，仅发夹爪"
+                )
+                if self._should_send_gripper(target_gripper):
+                    self._servo_gripper(target_gripper)
+                    self.last_sent_gripper = target_gripper
+                    self.last_gripper_cmd = target_gripper
+                return self._update_display(exec_step, current_state, target_joints, target_gripper)
+
+        self.robot.servo_joint_pos(target_joints.tolist())
+        if self._should_send_gripper(target_gripper):
+            self._servo_gripper(target_gripper)
+            self.last_sent_gripper = target_gripper
+            self.last_gripper_cmd = target_gripper
+
+        return self._update_display(exec_step, current_state, target_joints, target_gripper)
+
     def run_single_step(self, step: int) -> bool:
         try:
             obs = self.get_observation()
@@ -240,15 +277,19 @@ class AirbotPlayInferenceRunner:
             target_joints = actions[0, :6]
             target_gripper = float(actions[0, 6])
 
-            delta_from_current = target_joints - np.array(current_state[:6])
-            print(f"  → 发送目标: {_fmt(target_joints)}  夹爪={target_gripper:.4f}")
-            print(f"  → 与当前差: {_fmt(delta_from_current)}")
-
-            # 更新可视化（同时检测急停键）
-            self._update_display(step, current_state, target_joints, target_gripper)
-
-            if self._stop_requested:
-                return False
+            # ---- Z轴高度保护 ----
+            if self.min_z_height is not None and not self.dry_run:
+                end_pose = self.robot.left._robot.get_end_pose()
+                if end_pose is not None:
+                    current_z = end_pose[0][2]
+                    if current_z < self.min_z_height:
+                        logger.warning(f"Z轴保护: 当前Z={current_z:.4f} < 限制{self.min_z_height:.4f}，仅发夹爪指令")
+                        # 只发夹爪，不发关节（防止继续下压）
+                        if not self.dry_run and self._should_send_gripper(target_gripper):
+                            self._servo_gripper(target_gripper)
+                            self.last_sent_gripper = target_gripper
+                            self.last_gripper_cmd = target_gripper
+                        return True
 
             if not self.dry_run:
                 self.robot.servo_joint_pos(target_joints.tolist())
@@ -270,16 +311,18 @@ class AirbotPlayInferenceRunner:
     # ------------------------------------------------------------------ #
     def run_continuous(self, num_steps: Optional[int] = None, timeout: Optional[float] = None):
         logger.info("=" * 60)
-        logger.info(f"开始推理  |  task='{self.task_prompt}'  |  freq={self.inference_freq}Hz")
+        logger.info(f"开始推理  |  task='{self.task_prompt}'  |  freq={self.inference_freq}Hz"
+                    f"  |  chunk_execute={self.chunk_execute}")
         logger.info("急停：按 q 或 Esc（有窗口时），或在终端输入 q 回车")
         logger.info("=" * 60)
 
-        # 无显示窗口时启动 stdin 监听
         if not self.show_display and not self.dry_run:
             self._start_stdin_stop_listener()
 
-        step = 0
+        exec_step = 0
         start_time = time.monotonic()
+        chunk = None
+        chunk_idx = 0
 
         try:
             if not self.dry_run:
@@ -289,7 +332,6 @@ class AirbotPlayInferenceRunner:
             if obs is None:
                 logger.error("无法获取初始观测")
                 return
-
             logger.info(f"起始状态: {_fmt(obs['observation/state'][:6])}")
 
             if not self.dry_run:
@@ -297,26 +339,54 @@ class AirbotPlayInferenceRunner:
                 time.sleep(0.1)
 
             while not self._stop_requested:
-                if num_steps is not None and step >= num_steps:
+                if num_steps is not None and exec_step >= num_steps:
                     logger.info(f"完成 {num_steps} 步")
                     break
                 if timeout is not None and (time.monotonic() - start_time) > timeout:
                     logger.info(f"超时 {timeout}s")
                     break
 
-                step_start = time.monotonic()
-                self.run_single_step(step)
+                # ---- 需要重新推理 ----
+                if chunk is None or chunk_idx >= self.chunk_execute:
+                    obs = self.get_observation()
+                    if obs is None:
+                        break
+                    current_state = obs["observation/state"]
 
-                if self._stop_requested:
-                    logger.warning("急停！立即回零点...")
-                    break
+                    t0 = time.monotonic()
+                    outputs = self.policy.infer(obs)
+                    infer_time = time.monotonic() - t0
+
+                    chunk = outputs["actions"]  # (10, 7)
+                    chunk_idx = 0
+
+                    print(f"\n{'='*60}")
+                    print(f"[Infer]  exec_step={exec_step}  耗时={infer_time*1000:.1f}ms")
+                    print(f"  当前关节 : {_fmt(current_state[:6])}  夹爪={current_state[6]:.4f}")
+                    print(f"  即将执行 chunk[0..{self.chunk_execute-1}]:")
+                    for i in range(min(self.chunk_execute, len(chunk))):
+                        diff = chunk[i, :6] - current_state[:6]
+                        print(f"    [{i}]: {_fmt(chunk[i, :6])}  夹爪={chunk[i,6]:.4f}"
+                            f"  Δ={_fmt(diff)}")
+
+                # ---- 执行 chunk 中当前子步 ----
+                step_start = time.monotonic()
+
+                if not self.dry_run:
+                    if not self._execute_action(exec_step, chunk[chunk_idx]):
+                        self._stop_requested = True
+                        break
+                else:
+                    print(f"  [DRY RUN] chunk[{chunk_idx}]: {_fmt(chunk[chunk_idx, :6])}"
+                        f"  夹爪={chunk[chunk_idx, 6]:.4f}")
+
+                chunk_idx += 1
+                exec_step += 1
 
                 elapsed = time.monotonic() - step_start
                 sleep_time = self.inference_interval - elapsed
                 if sleep_time > 0:
                     time.sleep(sleep_time)
-
-                step += 1
 
         except KeyboardInterrupt:
             logger.info("\nCtrl+C 中断")
@@ -358,13 +428,17 @@ def main():
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--timeout", type=float, default=None)
     parser.add_argument("--play-config", type=str,
-                        default="/home/ypf/qiuzhiarm_LLM/config/play_config.json")
+                        default=str(pathlib.Path(__file__).parent / "airbot" / "play_config.json"))
     parser.add_argument("--dry-run", action="store_true",
                         help="只打印推理结果，不发出运动指令")
     parser.add_argument("--debug", action="store_true",
                         help="打印完整的 10 步动作块")
     parser.add_argument("--no-display", action="store_true",
                         help="禁用相机可视化窗口（用 stdin q 急停）")
+    parser.add_argument("--min-z", type=float, default=-0.065,
+                        help="末端Z轴最低高度(米)，低于此值只发夹爪不下压，如 -0.02")    
+    parser.add_argument("--chunk", type=int, default=5,
+                        help="每次推理后执行几步动作再重新推理 (default: 5)")    
     args = parser.parse_args()
 
     with open(args.play_config, "r", encoding="utf-8") as f:
@@ -382,6 +456,7 @@ def main():
         dry_run=args.dry_run,
         debug=args.debug,
         no_display=args.no_display,
+        min_z_height=args.min_z,
     )
     runner.run_continuous(num_steps=args.steps, timeout=args.timeout)
 

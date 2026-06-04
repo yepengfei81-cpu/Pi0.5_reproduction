@@ -1,0 +1,9 @@
+{
+  "arm": {
+    "port": 50050
+  },
+  "cameras": {
+    "head_serial": "230422271972",
+    "wrist_serial": "230422271433"
+  }
+}

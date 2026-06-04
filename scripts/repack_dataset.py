@@ -1,9 +1,28 @@
 """直接用 pyarrow 修复 parquet 文件中 'List' -> 'Sequence' 的兼容性问题"""
+import argparse
 import json
+import os
 from pathlib import Path
 import pyarrow.parquet as pq
 
-DATA_DIR = Path("/root/autodl-tmp/data/airbot_play_data")
+# 数据集根目录取自 HF_LEROBOT_HOME（与 collect_data.py / 训练保持一致），
+# 未设置时回退到 lerobot 默认缓存目录。可用 --repo-id / --data-dir 覆盖。
+parser = argparse.ArgumentParser(description="修复 LeRobot parquet 元数据兼容性")
+parser.add_argument("--repo-id", type=str, default="airbot_play_data",
+                    help="数据集名称（HF_LEROBOT_HOME 下的子目录）")
+parser.add_argument("--data-dir", type=str, default=None,
+                    help="直接指定数据集目录，优先级高于 HF_LEROBOT_HOME/repo-id")
+args = parser.parse_args()
+
+if args.data_dir:
+    DATA_DIR = Path(args.data_dir)
+else:
+    lerobot_home = os.environ.get(
+        "HF_LEROBOT_HOME", str(Path.home() / ".cache" / "huggingface" / "lerobot")
+    )
+    DATA_DIR = Path(lerobot_home) / args.repo_id
+
+print(f"数据集目录: {DATA_DIR}")
 
 parquet_files = sorted(DATA_DIR.rglob("*.parquet"))
 print(f"找到 {len(parquet_files)} 个 parquet 文件")
