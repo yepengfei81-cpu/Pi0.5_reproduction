@@ -289,28 +289,29 @@ def plot_plan_compare(ref_pos, ref_rpy, act_pos, act_rpy, out_png,
     fig.tight_layout(); fig.savefig(out_png, dpi=110); plt.close(fig)
 
 
-def plot_fk_compare(t, cmd_pos, cmd_rpy, act_pos, act_rpy, out_png):
-    """指令位姿 vs 机械臂实测 FK 位姿，逐帧对比。"""
+def plot_fk_compare(t_cmd, cmd_pos, cmd_rpy, t_act, act_pos, act_rpy, out_png):
+    """指令位姿 vs 机械臂实测 FK，按各自时间轴叠画(指令与实测采样率可不同)。"""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    cmd_pos, act_pos = np.array(cmd_pos), np.array(act_pos)
-    cmd_rpy, act_rpy = np.array(cmd_rpy), np.array(act_rpy)
-    n = min(len(cmd_pos), len(act_pos))
-    t = np.asarray(t)[:n]
+    cmd_pos, cmd_rpy = np.array(cmd_pos), np.array(cmd_rpy)
+    act_pos, act_rpy = np.array(act_pos), np.array(act_rpy)
+    t_cmd, t_act = np.asarray(t_cmd), np.asarray(t_act)
     fig, axes = plt.subplots(2, 3, figsize=(16, 8))
     for i, lbl in enumerate("xyz"):
         ax = axes[0, i]
-        ax.plot(t, cmd_pos[:n, i], label="cmd", lw=1.5)
-        ax.plot(t, act_pos[:n, i], "--", label="actual FK", lw=1.2)
-        err = np.abs(cmd_pos[:n, i] - act_pos[:n, i])
+        ax.plot(t_cmd, cmd_pos[:, i], label="cmd", lw=1.5)
+        ax.plot(t_act, act_pos[:, i], "--", label="actual FK", lw=1.2)
+        act_on_cmd = np.interp(t_cmd, t_act, act_pos[:, i])   # 对齐到指令时间算误差
+        err = np.abs(cmd_pos[:, i] - act_on_cmd)
         ax.set_title(f"pos {lbl}  err mean={err.mean()*1000:.1f}mm max={err.max()*1000:.1f}mm")
         ax.legend(fontsize=8); ax.grid(alpha=0.3); ax.set_xlabel("t(s)"); ax.set_ylabel("m")
     for i, lbl in enumerate(["roll", "pitch", "yaw"]):
         ax = axes[1, i]
-        ax.plot(t, cmd_rpy[:n, i], label="cmd", lw=1.5)
-        ax.plot(t, act_rpy[:n, i], "--", label="actual FK", lw=1.2)
-        err = np.abs(cmd_rpy[:n, i] - act_rpy[:n, i])
+        ax.plot(t_cmd, cmd_rpy[:, i], label="cmd", lw=1.5)
+        ax.plot(t_act, act_rpy[:, i], "--", label="actual FK", lw=1.2)
+        act_on_cmd = np.interp(t_cmd, t_act, act_rpy[:, i])
+        err = np.abs(cmd_rpy[:, i] - act_on_cmd)
         ax.set_title(f"{lbl}  err mean={err.mean():.1f}deg max={err.max():.1f}deg")
         ax.legend(fontsize=8); ax.grid(alpha=0.3); ax.set_xlabel("t(s)"); ax.set_ylabel("deg")
     fig.tight_layout(); fig.savefig(out_png, dpi=110); plt.close(fig)
@@ -536,7 +537,7 @@ def replay(args):
             print(f"\n就位。即将用路点规划复现 {len(cmd_pos)} 帧轨迹"
                   f"(每 {max(1, args.plan_step)} 帧取 1 路点)，由下位机规划执行")
         else:
-            print(f"\n就位。即将以 {args.rate}Hz 伺服跟踪 {len(cmd_pos)} 帧 "
+            print(f"\n就位。即将以 {args.servo_hz:.0f}Hz 伺服跟踪 "
                   f"({t[-1]:.1f}s)，Ctrl+C 随时中断")
         if input("开始回放? (yes/no) > ").strip().lower() != "yes":
             print("取消"); return
@@ -577,35 +578,63 @@ def replay(args):
         servo_mode = getattr(RobotMode, "SERVO_CART_POSE", None)
         if servo_mode is None:
             sys.exit("✗ airbot_py 没有 SERVO_CART_POSE 模式，请告知实际枚举名")
+
+        # 关键：servo 跟踪要切到更快的速度档。'slow' 把 moveit_servo 旋转/线性
+        # scale 限到 0.05，旋转跟随被压到 5%，导致姿态(尤其大角度 pitch)严重滞后
+        # —— 即使把轨迹放到极慢也跟不满。'default'(0.2)/'fast'(10) 给足旋转增益。
+        # 接近起点仍用 slow(安全)，这里才切。
+        print(f"切换速度档位 slow -> '{args.speed_profile}' 供 servo 跟踪")
+        robot.set_speed_profile(args.speed_profile)
+        time.sleep(0.1)
+
+        # 高频密集重采样供 servo：SDK servo 控制器内部 ~250Hz，必须高频(默认100Hz)
+        # 喂目标否则严重滞后(10Hz 那种)。仿 dynamic_pose_trajectory.py 验证过的方式。
+        ts_s, pos_w_s, R_w_s, grip_s = load_and_resample(
+            npz_path, args.servo_hz, args.speed_scale)
+        cmd_pos_s, cmd_R_s = to_base_frame(pos_w_s, R_w_s, start_pos,
+                                           args.start_yaw, R_align, args.robot_tip_offset)
+        quats_s = np.stack([rot_to_quat_xyzw(R) for R in cmd_R_s])
+        cmd_rpy_s = np.array([euler_zyx_deg(R) for R in cmd_R_s])
+        g01_s = np.clip(grip_s / args.gripper_max, 0.0, 1.0)
+        n = len(cmd_pos_s)
+        step_mm = np.linalg.norm(np.diff(cmd_pos_s, axis=0), axis=1) * 1000
+        print(f"伺服: {n} 个目标 @ {args.servo_hz:.0f}Hz, "
+              f"每步 mean={step_mm.mean():.2f}mm max={step_mm.max():.2f}mm")
+
         robot.switch_mode(servo_mode)
         time.sleep(0.2)
+        # 先播种初始目标，让 servo 控制器有保持点再开始流式
+        robot.servo_cart_pose(cmd_pos_s[0].tolist(), quats_s[0].tolist())
+        time.sleep(0.3)
 
-        dt = 1.0 / args.rate
+        dt = 1.0 / args.servo_hz
+        fk_every = max(1, round(args.servo_hz / 50.0))   # FK 采样限到 ~50Hz 不拖慢主循环
         last_g = None
-        act_pos, act_rpy = [], []
-        for k in range(len(cmd_pos)):
-            t0 = time.monotonic()
-            if args.log_fk:                     # 发指令前读真实 FK（反映上一帧跟踪结果）
+        act_t, act_pos, act_rpy = [], [], []
+        t_start = time.monotonic()
+        next_t = t_start
+        for k in range(n):
+            if args.log_fk and (k % fk_every == 0):
                 ap, aq = robot.get_end_pose()
+                act_t.append(time.monotonic() - t_start)
                 act_pos.append(list(ap))
                 act_rpy.append(euler_zyx_deg(quat_to_rot(*aq)))
-            if cmd_pos[k][2] < min_z:           # 最后一道 z 保护
-                print(f"  [{k}] z={cmd_pos[k][2]:.3f} < min-z, 跳过该帧位置指令")
-            else:
-                robot.servo_cart_pose(cmd_pos[k].tolist(), quats[k].tolist())
-            g = float(g01[k])
+            if cmd_pos_s[k][2] >= min_z:         # z 保护
+                robot.servo_cart_pose(cmd_pos_s[k].tolist(), quats_s[k].tolist())
+            g = float(g01_s[k])
             if last_g is None or abs(g - last_g) > 0.01:
                 robot.left._robot.servo_eef_pos([g])
                 last_g = g
-            time.sleep(max(0.0, dt - (time.monotonic() - t0)))
+            next_t += dt                         # 绝对调度，避免累积 sleep 漂移
+            pad = next_t - time.monotonic()
+            if pad > 0:
+                time.sleep(pad)
         print("✓ 回放完成")
-        if args.log_fk and act_pos:
+        if args.log_fk and len(act_pos) > 5:
             out_png = npz_path.parent / f"{npz_path.stem}_fk_compare.png"
-            plot_fk_compare(t, cmd_pos, cmd_rpy, act_pos, act_rpy, out_png)
-            ce = np.abs(cmd_rpy[:len(act_rpy)] - np.array(act_rpy))
+            plot_fk_compare(ts_s, cmd_pos_s, cmd_rpy_s,
+                            np.array(act_t), act_pos, act_rpy, out_png)
             print(f"  ✓ FK 对比图: {out_png}")
-            print(f"  姿态跟踪误差 roll/pitch/yaw mean={ce.mean(0).round(1)}° "
-                  f"max={ce.max(0).round(1)}°")
     except KeyboardInterrupt:
         print("\n中断")
     finally:
@@ -647,11 +676,21 @@ def main():
     ap.add_argument("--robot-tip-offset", nargs=3, type=float, default=[0.0, 0.0, 0.0],
                     metavar=("X", "Y", "Z"),
                     help="get_end_pose 参考点->机械臂指尖偏移 (工具系, m)，待标定")
-    ap.add_argument("--rate", type=float, default=10.0, help="伺服频率 Hz (默认 10)")
+    ap.add_argument("--rate", type=float, default=10.0,
+                    help="离线重采样/安全检查/plan 模式的帧率 Hz (默认 10)")
+    ap.add_argument("--servo-hz", type=float, default=100.0,
+                    help="SERVO_CART_POSE 流式更新频率 Hz (默认 100；SDK 内部"
+                         "伺服 ~250Hz，喂太慢会严重滞后)")
+    ap.add_argument("--speed-profile", type=str, default="default",
+                    choices=["slow", "default", "fast"],
+                    help="servo 跟踪阶段的速度档(接近起点始终用 slow)。"
+                         "'slow' 旋转增益仅 0.05 会严重拖累姿态跟踪；"
+                         "默认 'default'(0.2)；姿态仍滞后可试 'fast'")
     ap.add_argument("--speed-scale", type=float, default=0.5,
                     help="回放速度倍率, 0.5=半速 (默认 0.5)")
-    ap.add_argument("--gripper-max", type=float, default=0.082,
-                    help="映射为机械臂全开(1.0)的 UMI 开口(m)，实测 UMI 最大 82mm (默认 0.082)")
+    ap.add_argument("--gripper-max", type=float, default=0.073,
+                    help="夹爪归一化共享参考 = AIRBOT 全开(m)；UMI 开口(米)÷此值 clip 到[0,1]。"
+                         "默认 0.073(AIRBOT 73mm)，与训练归一化(umi_to_lerobot)保持一致")
     ap.add_argument("--min-z", type=float, default=None,
                     help="base 系最低允许 z (m)；默认取 workspace 下界+1cm")
     ap.add_argument("--plan", action="store_true",

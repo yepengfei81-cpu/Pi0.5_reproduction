@@ -19,7 +19,9 @@ UMI mcap -> openpi/LeRobot 训练数据转换。
               pitch/roll 保持重力参考的绝对量, 位置/yaw 相对）
            -> pos(3) + rot6d(6) + gripper(1) 序列存 npz + 诊断图
          内置自检：6D 旋转往返误差、首帧位置/yaw 归零、重力方向语义。
-  [ ] 3. 夹爪：磁编码器读数(米) -> 物理开口标定 -> 共享参考归一化 [0,1]。
+  [✓] 3. 夹爪（--poses 时一并输出 gripper_norm）：磁编码器读数(米, 0=闭合)
+         -> clip(value / 0.073, 0, 1)。共享参考 = AIRBOT 全开 73mm；
+         UMI 全开 82mm 张到 >73mm 的部分 clip 到 1.0（同物理开口同归一值）。
   [ ] 4. 打包 LeRobot 数据集（base_0_rgb 置零 + image_mask=False，
          wrist 槽放去畸变后的主相机画面）。
 
@@ -204,6 +206,12 @@ DEFAULT_TCP_OFFSET = (0.1274, -0.0008, -0.0174)
 POSE_TOPIC = "/robot0/vio/eef_pose"
 GRIPPER_TOPIC = "/robot0/sensor/magnetic_encoder"
 
+# 夹爪归一化共享参考：两边 0 都=闭合；用 AIRBOT 全开(实测 73mm)做分母，
+# UMI(实测全开 82mm)张到 >73mm 的部分 clip 到 1.0。这样同一物理开口在
+# UMI/遥操作两边映射到同一个 [0,1] 值（物理一致，而非各自 min-max）。
+DEFAULT_ROBOT_GRIPPER_MAX = 0.073   # AIRBOT 指尖全开间距 (m)
+UMI_GRIPPER_MAX = 0.082             # UMI 全开 (m)，仅用于报告/校验
+
 
 def quat_to_rot(x, y, z, w) -> np.ndarray:
     n = (x * x + y * y + z * z + w * w) ** 0.5
@@ -349,7 +357,8 @@ def plot_episode(ep: dict, out_png: Path):
 
 
 def process_poses(mcap_path: Path, out_dir: Path, tcp_offset,
-                  pose_topic: str, gripper_topic: str):
+                  pose_topic: str, gripper_topic: str,
+                  robot_gripper_max: float = DEFAULT_ROBOT_GRIPPER_MAX):
     print(f"\n=== {mcap_path.name} (位姿提取) ===")
     ep = extract_episode(mcap_path, tcp_offset, pose_topic, gripper_topic)
     dur = (ep["ts"][-1] - ep["ts"][0]) / 1e9
@@ -359,12 +368,22 @@ def process_poses(mcap_path: Path, out_dir: Path, tcp_offset,
     for k, v in ep["checks"].items():
         print(f"  自检  {k}: {v}")
 
+    # 阶段3：夹爪归一化 -> [0,1]（共享参考 = AIRBOT 全开；超出部分 clip）
+    grip_m = ep["gripper_m"]
+    gripper_norm = np.clip(grip_m / robot_gripper_max, 0.0, 1.0)
+    if not np.isnan(grip_m).all():
+        n_clip = int(np.sum(grip_m > robot_gripper_max))
+        print(f"  夹爪: {np.nanmin(grip_m)*1000:.1f}~{np.nanmax(grip_m)*1000:.1f}mm "
+              f"-> [0,1] (÷{robot_gripper_max*1000:.0f}mm); "
+              f"{n_clip}/{len(grip_m)} 帧开口>{robot_gripper_max*1000:.0f}mm 被 clip 到 1.0")
+
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = mcap_path.stem
     npz = out_dir / f"{stem}_poses.npz"
     np.savez_compressed(
         npz, ts=ep["ts"], pos=ep["pos"], rot6d=ep["rot6d"],
         euler_deg=ep["euler_deg"], gripper_m=ep["gripper_m"],
+        gripper_norm=gripper_norm, robot_gripper_max=robot_gripper_max,
         cam_pos_w=ep["cam_pos_w"], tip_pos_w=ep["tip_pos_w"], quat_w=ep["quat_w"],
         tcp_offset=ep["tcp_offset"], yaw0_rad=ep["yaw0_rad"], t0_w=ep["t0_w"])
     png = out_dir / f"{stem}_poses.png"
@@ -463,6 +482,10 @@ def main():
                          f"(pivot_calib.py 标定)")
     ap.add_argument("--pose-topic", type=str, default=POSE_TOPIC)
     ap.add_argument("--gripper-topic", type=str, default=GRIPPER_TOPIC)
+    ap.add_argument("--robot-gripper-max", type=float, default=DEFAULT_ROBOT_GRIPPER_MAX,
+                    metavar="M",
+                    help=f"AIRBOT 夹爪全开间距(m)，作夹爪归一化共享参考分母, "
+                         f"默认 {DEFAULT_ROBOT_GRIPPER_MAX} (实测 73mm)")
     args = ap.parse_args()
 
     in_path = Path(args.input).expanduser().resolve()
@@ -483,7 +506,8 @@ def main():
     for m in mcaps:
         if args.poses:
             process_poses(m, out_dir, args.tcp_offset,
-                          args.pose_topic, args.gripper_topic)
+                          args.pose_topic, args.gripper_topic,
+                          args.robot_gripper_max)
         else:
             process_mcap(m, out_dir, args.fps, args.balance, args.fov_scale,
                          args.side_by_side, only, args.target_hfov)
