@@ -86,8 +86,8 @@ pip install pyrealsense2
 
 ```bash
 # 拉代码（务必带子模块）
-git clone --recurse-submodules <本仓库地址> Pi0.5_reproduction
-cd Pi0.5_reproduction
+git clone --recurse-submodules git@github.com:GelSight-lab/Pi0.5_airbot_play.git
+cd Pi0.5_airbot_play
 
 # 新建 conda 环境（python 3.11，openpi 要求 ≥3.11）
 conda create -n openpi_airbot python=3.11 -y
@@ -116,8 +116,8 @@ pip install pyrealsense2
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 拉代码
-git clone --recurse-submodules <本仓库地址> Pi0.5_reproduction
-cd Pi0.5_reproduction
+git clone --recurse-submodules git@github.com:GelSight-lab/Pi0.5_airbot_play.git
+cd Pi0.5_airbot_play
 
 # uv 按 uv.lock 装好 openpi + jax + torch 等全部依赖到项目本地 .venv
 GIT_LFS_SKIP_SMUDGE=1 uv sync
@@ -131,29 +131,31 @@ GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 
 数据集（约数 GB）和微调权重（约 9GB）**不进 git**，通过 HuggingFace 分发。
 
-### 4.1 仓库地址（建好后填写）
-- 数据集：`<待填：你的HF用户名>/airbot_play_data`
-- 权重：  `<待填：你的HF用户名>/pi05_airbot_play`
+### 4.1 仓库地址
+- 数据集：`dacongming666/airbot_play_data`
+- 权重：  `dacongming666/pi05_airbot_play`
 
 ### 4.2 上传（数据/权重的产出方执行）
 ```bash
-huggingface-cli login          # 用 Write 权限的 token
+hf auth login                  # 用 Write 权限的 token
 
 # 数据集（整个 lerobot 文件夹）
-huggingface-cli upload <用户名>/airbot_play_data "$HF_LEROBOT_HOME/airbot_play_data" . --repo-type dataset
-# 权重（某个 step 的 checkpoint）
-huggingface-cli upload <用户名>/pi05_airbot_play ./checkpoints/pi05_airbot_play/<exp-name>/<step> . --repo-type model
+hf upload dacongming666/airbot_play_data "$HF_LEROBOT_HOME/airbot_play_data" . --repo-type dataset
+
+# 权重：进入要分发的 checkpoint 目录，排除 train_state（推理用不到，且体积大）
+cd checkpoints/pi05_airbot_play/my_experiment/22000
+hf upload dacongming666/pi05_airbot_play . --exclude "train_state/*"
 ```
 
 ### 4.3 下载
 ```bash
 # 服务器下载数据集到 HF_LEROBOT_HOME（见第 5.2 节）
-huggingface-cli download <用户名>/airbot_play_data --repo-type dataset \
+hf download dacongming666/airbot_play_data --repo-type dataset \
   --local-dir "$HF_LEROBOT_HOME/airbot_play_data"
 
 # 本地下载权重用于推理
-huggingface-cli download <用户名>/pi05_airbot_play --repo-type model \
-  --local-dir ./checkpoints/pi05_airbot_play/my_experiment/16000
+hf download dacongming666/pi05_airbot_play \
+  --local-dir ./checkpoints/pi05_airbot_play/my_experiment/22000
 ```
 
 ---
@@ -198,13 +200,13 @@ conda activate openpi_airbot
 
 # 先 dry-run：只推理打印、不发运动指令（仍会连机械臂和相机）
 python local_inference.py \
-  --checkpoint ./checkpoints/pi05_airbot_play/my_experiment/16000 \
+  --checkpoint ./checkpoints/pi05_airbot_play/my_experiment/22000 \
   --task "pick up the block and place it in the bowl" \
   --steps 5 --freq 5 --dry-run
 
 # 确认预测正常后，去掉 --dry-run 真机运行
 python local_inference.py \
-  --checkpoint ./checkpoints/pi05_airbot_play/my_experiment/16000 \
+  --checkpoint ./checkpoints/pi05_airbot_play/my_experiment/22000 \
   --task "pick up the block and place it in the bowl"
 ```
 **安全**：有显示窗口时按 `q` / `Esc` 急停并回零位；无窗口时（`--no-display`）在终端输入 `q` 回车急停。`--min-z` 设末端最低高度防止压台面。
