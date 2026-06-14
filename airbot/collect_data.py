@@ -2,6 +2,16 @@
 openpi 数据收集脚本：遥操作 + 双相机录制 → LeRobot 格式
 硬件：Lead (Replay, can1:50051) + Follow (Play, can0:50050) + 2x D405
 
+记录内容（每帧）:
+  - 关节空间: state=follow 6关节+夹爪, actions=lead 6关节+夹爪 (7D, 老格式)
+  - 任务空间: state_eef/actions_eef = base 系 EEF(在线厂家FK get_end_pose)
+              pos3 + quat4(xyzw) + gripper1 = 8D
+    -> 用于和 UMI 数据联合训练；W'相对系/6D旋转/夹爪归一化的统一转换
+       由阶段4打包脚本完成（与 umi_to_lerobot 同套表示）。
+
+相机存储: video(H.264)，体积比逐帧 PNG 小 10~50 倍，且与 UMI 数据同格式
+          （便于阶段4合并联合训练）。openpi/LeRobot 加载时透明解码。
+
 用法:
     python collect_data.py --task "pick up the block and place it in the bowl"
 
@@ -198,8 +208,12 @@ def collect_episode(lead, follow, cameras, record_freq, control_freq,
             if step % record_interval == 0:
                 follow_joints = follow.get_joint_pos()
                 follow_eef = follow.get_eef_pos()
+                # 在线厂家 FK：base 系末端位姿 [[x,y,z],[qx,qy,qz,qw]]
+                follow_pose = follow.get_end_pose()   # state = 当前(follow)末端
+                lead_pose = lead.get_end_pose()        # action = 目标(lead)末端
 
-                if follow_joints is not None and follow_eef is not None:
+                if (follow_joints is not None and follow_eef is not None
+                        and follow_pose is not None and lead_pose is not None):
                     state = np.array(follow_joints + follow_eef, dtype=np.float32)
 
                     gripper_val = lead_eef if lead_eef and len(lead_eef) > 0 else [0.0]
@@ -207,11 +221,22 @@ def collect_episode(lead, follow, cameras, record_freq, control_freq,
                         list(lead_joints) + list(gripper_val), dtype=np.float32
                     )
 
+                    # EEF (base 系, 原始): pos3 + quat4(xyzw) + gripper1 = 8D
+                    # W'/6D/夹爪归一化的统一转换交给阶段4打包脚本(与 UMI 同套代码)
+                    state_eef = np.array(
+                        list(follow_pose[0]) + list(follow_pose[1])
+                        + list(follow_eef[:1]), dtype=np.float32)
+                    action_eef = np.array(
+                        list(lead_pose[0]) + list(lead_pose[1])
+                        + list(gripper_val[:1]), dtype=np.float32)
+
                     head_bgr, wrist_bgr = cameras.get_frames()
 
                     frames.append({
                         "state": state,
                         "action": action,
+                        "state_eef": state_eef,
+                        "action_eef": action_eef,
                         "head_rgb": bgr_to_rgb(head_bgr),
                         "wrist_rgb": bgr_to_rgb(wrist_bgr),
                     })
@@ -258,27 +283,30 @@ def collect_episode(lead, follow, cameras, record_freq, control_freq,
 
     return frames
 
-def save_to_lerobot(all_episodes, task, repo_id, record_freq, output_dir=None):
+def create_lerobot_dataset(repo_id, record_freq, output_dir=None):
+    """开头创建一次空数据集；之后每条 episode 立即写盘（低内存、抗崩溃）。"""
+    import lerobot.common.datasets.lerobot_dataset as lr_ds
     from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
 
-    if output_dir:
-        save_dir = Path(output_dir) / repo_id
-    else:
-        save_dir = HF_LEROBOT_HOME / repo_id
+    # 相机用 video(H.264) 存储：体积比逐帧 PNG 小 10~50 倍，且与 UMI 数据同格式。
+    # LeRobot 默认编码器是 libsvtav1（本机 pyav 无此编码器），改用 h264(=libx264)。
+    if not getattr(lr_ds, "_h264_patched", False):
+        _orig_encode = lr_ds.encode_video_frames
+        def _encode_h264(*a, **k):
+            k.setdefault("vcodec", "h264")
+            return _orig_encode(*a, **k)
+        lr_ds.encode_video_frames = _encode_h264
+        lr_ds._h264_patched = True
 
-    info_file = save_dir / "meta" / "info.json"
-
-    if info_file.exists():
-        # 已有数据集，加一个时间戳后缀避免冲突
+    base = Path(output_dir) if output_dir else HF_LEROBOT_HOME
+    save_dir = base / repo_id
+    if (save_dir / "meta" / "info.json").exists():
+        # 已有同名数据集，加时间戳后缀避免冲突（分多次采集会得到多个数据集，
+        # 阶段4打包时合并）
         import datetime
-        suffix = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        new_repo_id = f"{repo_id}_{suffix}"
-        if output_dir:
-            save_dir = Path(output_dir) / new_repo_id
-        else:
-            save_dir = HF_LEROBOT_HOME / new_repo_id
-        logger.info(f"已有数据集存在，新建: {new_repo_id}")
-        repo_id = new_repo_id
+        repo_id = f"{repo_id}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        save_dir = base / repo_id
+        logger.info(f"已有数据集存在，新建: {repo_id}")
 
     logger.info(f"创建数据集: {repo_id} (fps={record_freq})")
     dataset = LeRobotDataset.create(
@@ -288,12 +316,12 @@ def save_to_lerobot(all_episodes, task, repo_id, record_freq, output_dir=None):
         root=save_dir,
         features={
             "image": {
-                "dtype": "image",
+                "dtype": "video",
                 "shape": (480, 640, 3),
                 "names": ["height", "width", "channel"],
             },
             "wrist_image": {
-                "dtype": "image",
+                "dtype": "video",
                 "shape": (480, 640, 3),
                 "names": ["height", "width", "channel"],
             },
@@ -307,25 +335,38 @@ def save_to_lerobot(all_episodes, task, repo_id, record_freq, output_dir=None):
                 "shape": (7,),
                 "names": ["actions"],
             },
+            # base 系原始 EEF: pos3 + quat4(xyzw) + gripper1。阶段4打包脚本
+            # 把它和 UMI 一起转成统一的 W'/6D/归一化训练表示。
+            "state_eef": {
+                "dtype": "float32",
+                "shape": (8,),
+                "names": ["state_eef"],
+            },
+            "actions_eef": {
+                "dtype": "float32",
+                "shape": (8,),
+                "names": ["actions_eef"],
+            },
         },
         image_writer_threads=4,
         image_writer_processes=2,
     )
+    return dataset, save_dir
 
-    for ep_idx, frames in enumerate(all_episodes):
-        for frame in frames:
-            dataset.add_frame({
-                "image": frame["head_rgb"],
-                "wrist_image": frame["wrist_rgb"],
-                "state": frame["state"],
-                "actions": frame["action"],
-                "task": task,
-            })
-        dataset.save_episode()
-        logger.info(f"  保存 Episode {ep_idx + 1}/{len(all_episodes)} ({len(frames)} 帧)")
 
-    logger.info(f"数据集共 {dataset.num_episodes} 条 episode")
-    logger.info(f"保存在: {save_dir}")
+def write_episode(dataset, frames, task):
+    """把一条 episode 立即写入数据集（add_frame + save_episode）。"""
+    for frame in frames:
+        dataset.add_frame({
+            "image": frame["head_rgb"],
+            "wrist_image": frame["wrist_rgb"],
+            "state": frame["state"],
+            "actions": frame["action"],
+            "state_eef": frame["state_eef"],
+            "actions_eef": frame["action_eef"],
+            "task": task,
+        })
+    dataset.save_episode()
 
 
 def main():
@@ -353,7 +394,10 @@ def main():
     if show_display:
         cv2.namedWindow("Data Collection", cv2.WINDOW_AUTOSIZE)
 
-    all_episodes = []
+    # 开头创建数据集（懒创建：第一条 episode 确认保存时才建），之后每条立即写盘
+    dataset = None
+    save_dir = None
+    num_saved = 0
     logger.info("=" * 60)
     logger.info(f"任务: {args.task}")
     logger.info(f"记录频率: {args.record_freq} Hz")
@@ -365,7 +409,7 @@ def main():
         reset_to_home(follow)
 
         while True:
-            logger.info(f"\n--- Episode {len(all_episodes) + 1} ---")
+            logger.info(f"\n--- Episode {num_saved + 1} ---")
             logger.info("按 Enter 准备录制，按 q+Enter 结束收集")
 
             # 等待输入时持续刷新相机画面
@@ -374,7 +418,7 @@ def main():
                 while True:
                     head_bgr, wrist_bgr = cameras.get_frames()
                     show_camera_view(head_bgr, wrist_bgr,
-                                     len(all_episodes) + 1, 0, args.record_freq)
+                                     num_saved + 1, 0, args.record_freq)
                     if select.select([sys.stdin], [], [], 0.03)[0]:
                         cmd = sys.stdin.readline().strip().lower()
                         break
@@ -388,18 +432,24 @@ def main():
                 lead, follow, cameras,
                 record_freq=args.record_freq,
                 control_freq=CONTROL_FREQ,
-                episode_num=len(all_episodes) + 1,
+                episode_num=num_saved + 1,
                 show_display=show_display,
             )
             if episode is not None:
-                all_episodes.append(episode)
-                logger.info(f"已收集 {len(all_episodes)} 条 episode")
+                # 懒创建数据集 + 立即写盘（低内存、崩溃最多只丢当前这条）
+                if dataset is None:
+                    dataset, save_dir = create_lerobot_dataset(
+                        args.repo_id, args.record_freq, args.output_dir)
+                write_episode(dataset, episode, args.task)
+                num_saved += 1
+                del episode   # 立刻释放该条的图像内存
+                logger.info(f"已保存 {num_saved} 条 episode -> {save_dir}")
 
             # 每条 episode 结束后回零位
             reset_to_home(follow)
 
     except KeyboardInterrupt:
-        logger.info("\n收集被中断")
+        logger.info("\n收集被中断（已保存的 episode 不受影响）")
 
     finally:
         follow.switch_mode(RobotMode.PLANNING_POS)
@@ -410,12 +460,8 @@ def main():
         if show_display:
             cv2.destroyAllWindows()
 
-    if all_episodes:
-        logger.info(f"\n开始保存 {len(all_episodes)} 条 episode 到 LeRobot 格式...")
-        save_to_lerobot(
-            all_episodes, args.task, args.repo_id,
-            args.record_freq, args.output_dir,
-        )
+    if num_saved > 0:
+        logger.info(f"\n完成：共保存 {num_saved} 条 episode 到 {save_dir}")
     else:
         logger.info("没有收集到数据")
 
