@@ -1,237 +1,213 @@
-# AirBot Play × openpi (π0.5) 复现与部署指南
+# AirBot Play × openpi (π0.5): Reproduction & Deployment Guide
 
-本仓库基于 [openpi](https://github.com/Physical-Intelligence/openpi) 复现 **π0.5 (pi05)** 视觉-语言-动作模型，并适配 **AIRBOT Play** 机械臂：从遥操作采集真机数据 → 服务器训练 → 本地实时推理，完整跑通。
+This repo reproduces the **π0.5 (pi05)** vision-language-action model from
+[openpi](https://github.com/Physical-Intelligence/openpi) and adapts it to the
+**AIRBOT Play** arm. It covers two end-to-end pipelines:
 
-> openpi 上游的原始英文文档见 [README_openpi.md](README_openpi.md)。
+- **Pipeline A — joint space, single task**: teleop collection → server training → local real-time inference (`local_inference.py`, config `pi05_airbot_play`).
+- **Pipeline B — task space (EEF), UMI + teleop co-training**: convert handheld **UMI** data and AIRBOT teleop data into one shared task-space dataset → co-train → deploy (`local_inference_eef.py`, config `pi05_cotrain_eef`). This is the current focus: injecting new skills (e.g. *wipe the blackboard*, collected cheaply with a handheld UMI gripper) into a robot that is also trained on teleop tasks (e.g. *pick up the block*).
 
----
-
-## 0. 总览
-
-### 整套流程
-```
-[本地工作站]  遥操作采集数据 (collect_data.py)
-      │  上传数据集到 HuggingFace
-      ▼
-[训练服务器]  repack → 算 norm_stats → 训练 (train.py)
-      │  上传权重到 HuggingFace
-      ▼
-[本地工作站]  下载权重 → 实时推理 (local_inference.py)
-```
-
-### 两类机器、两套环境
-| 机器 | 环境工具 | 用途 |
-|------|----------|------|
-| **本地工作站**（接机械臂+相机+GPU） | **conda**（方案 A，一锅端） | 采集数据、本地推理 |
-| **训练服务器**（大显存 GPU，无机械臂） | **uv** | 训练 |
-
-> 为什么本地用 conda、服务器用 uv：本地推理脚本要在**同一进程**里同时加载 openpi 模型和机械臂 SDK，conda 一个环境装全最省事；服务器只跑训练，用 openpi 官方推荐的 uv 最干净。
-
-### 硬件（本套配置，换硬件需相应修改）
-- **机械臂 ×2**：Lead（Replay 无动力主臂，gRPC 端口 `50051`）+ Follow（Play 有动力从臂，端口 `50050`）
-- **相机 ×2**：RealSense D405
-  - head（环境相机）SN `230422271972`
-  - wrist（手眼相机）SN `230422271433`
-- **GPU**：推理 ≥8GB；LoRA 微调 ≥22.5GB（详见 [README_openpi.md](README_openpi.md)）
-- **系统**：Ubuntu 20.04+
-
-> 相机序列号在 [airbot/play_config.json](airbot/play_config.json) 和 [airbot/collect_data.py](airbot/collect_data.py) 里，换相机改这两处。
+> 中文版见 [README_zh.md](README_zh.md). Upstream openpi docs: [README_openpi.md](README_openpi.md).
 
 ---
 
-## 1. 机械臂 & 相机环境（系统级，仅真机端需要）
+## 0. Overview
 
-> 这一步配置 AIRBOT Play 的驱动和 SDK，是采集/推理的前提。**只在接了机械臂的本地工作站上做**，训练服务器不需要。
+### Two machines, two environments
+| Machine | Env tool | Used for |
+|---|---|---|
+| **Local workstation** (arm + cameras + GPU) | **conda** (one env for everything) | data collection, local inference |
+| **Training server** (big GPU, no arm) | **uv** | training, norm-stats |
 
-### 1.1 获取厂家软件包
-`airbot-configure`（驱动 .deb）和 `airbot_py`（Python SDK .whl）是 **AIRBOT 专有软件**，不在本仓库内（专有软件不便随 MIT 仓库分发）。
+The local inference scripts load the openpi model **and** the arm SDK in the
+same process, so one conda env is simplest. The server only trains, so it uses
+openpi's recommended `uv`.
 
-Ubuntu + 纯 Python 使用，**只需以下两个文件**：
+### Hardware (this setup; change the configs if yours differs)
+- **Arms ×2**: Lead (Replay, passive leader, gRPC port `50051`) + Follow (Play, powered follower, port `50050`).
+- **Cameras ×2**: RealSense D405 — head/env SN `230422271972`, wrist/eye-in-hand SN `230422271433`.
+- **GPU**: inference ≥8 GB; LoRA fine-tuning ≥22.5 GB.
+- **OS**: Ubuntu 20.04+.
 
-| 文件 | 用途 |
-|------|------|
-| `airbot-configure_5.1.6-1_all.deb` | 驱动（配置 CAN/udev），架构无关 |
+Camera serials live in [airbot/play_config.json](airbot/play_config.json) and [airbot/collect_data.py](airbot/collect_data.py).
+
+---
+
+## 1. Arm & camera setup (system level, real-robot side only)
+
+Proprietary AIRBOT software is **not** in this repo. For Ubuntu + pure-Python use you only need:
+
+| File | Purpose |
+|---|---|
+| `airbot-configure_5.1.6-1_all.deb` | driver (CAN / udev) |
 | `airbot_py-5.1.6-py3-none-any.whl` | Python SDK |
 
-> `airbot_cpp-*.deb`（C++ SDK）本项目用不到，无需获取。
-
-获取方式：
-- **官方途径**：联系 AIRBOT 技术支持获取（不同固件版本配套的驱动不同，务必拿对应版本）；
-- **本实验室成员**：从云盘下载 → **📦 下载链接（待填）：`<在此粘贴 Google Drive 链接>`**
-
-### 1.2 安装驱动（配置 CAN 接口 / udev 规则）
 ```bash
-sudo apt-get install ./airbot-configure_5.1.6-1_all.deb
-dpkg -l | grep airbot          # 看到版本号即成功
+sudo apt-get install ./airbot-configure_5.1.6-1_all.deb   # driver
+pip install ./airbot_py-5.1.6-py3-none-any.whl            # SDK (into the conda env from §2)
+pip install pyrealsense2                                  # cameras
 ```
 
-### 1.3 安装 Python SDK（在第 2 步建好的 conda 环境里装）
-```bash
-pip install ./airbot_py-5.1.6-py3-none-any.whl
-python -c "import airbot_py; print('airbot_py OK')"
-```
-
-### 1.4 相机库
-```bash
-pip install pyrealsense2
-```
-
-> 机械臂封装 [airbot/play_sdk.py](airbot/play_sdk.py) 已包含在本仓库里，无需单独安装。
+The arm wrapper [airbot/play_sdk.py](airbot/play_sdk.py) is already in the repo.
 
 ---
 
-## 2. 本地环境（conda，方案 A）—— 采集 + 推理
-
-> 一个 conda 环境装下 openpi + 机械臂 SDK + 相机，`collect_data.py` 和 `local_inference.py` 都在这里跑。
+## 2. Local environment (conda) — collection + inference
 
 ```bash
-# 拉代码（务必带子模块）
-git clone --recurse-submodules git@github.com:GelSight-lab/Pi0.5_airbot_play.git
-cd Pi0.5_airbot_play
-
-# 新建 conda 环境（python 3.11，openpi 要求 ≥3.11）
+git clone --recurse-submodules <repo-url> && cd <repo>
 conda create -n openpi_airbot python=3.11 -y
 conda activate openpi_airbot
 
-# 安装 openpi 全家桶
 pip install -e packages/openpi-client
 pip install "lerobot @ git+https://github.com/huggingface/lerobot@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5"
 pip install -e .
-
-# 安装机械臂 SDK + 相机（见第 1 章）
-pip install ./airbot_py-5.1.6-py3-none-any.whl
-pip install pyrealsense2
+pip install ./airbot_py-5.1.6-py3-none-any.whl pyrealsense2
 ```
 
-> 系统级 NVIDIA 驱动 / CUDA 需自行装好，`nvidia-smi` 能正常输出即可。
+System NVIDIA driver / CUDA must already work (`nvidia-smi`).
 
 ---
 
-## 3. 服务器训练环境（uv）
-
-> 训练服务器不接机械臂，只需 openpi。用 uv 安装。
+## 3. Server environment (uv) — training
 
 ```bash
-# 安装 uv（装在 conda 之外，全局可用；不要 pip install 进 conda 环境）
 curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# 拉代码
-git clone --recurse-submodules git@github.com:GelSight-lab/Pi0.5_airbot_play.git
-cd Pi0.5_airbot_play
-
-# uv 按 uv.lock 装好 openpi + jax + torch 等全部依赖到项目本地 .venv
+git clone --recurse-submodules <repo-url> && cd <repo>
 GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 ```
-后续训练命令统一用 `uv run python ...`。
+All training commands then use `uv run python ...`.
+
+> The server needs `ffmpeg` for video decoding (`apt-get install ffmpeg`); the
+> LeRobot datasets here store cameras as H.264 video.
 
 ---
 
-## 4. 数据集 & 权重（HuggingFace）
+## 4. Pipeline A — joint space, single task
 
-数据集（约数 GB）和微调权重（约 9GB）**不进 git**，通过 HuggingFace 分发。
+State/action = 6 joints + gripper (7D), absolute joint targets.
 
-### 4.1 仓库地址
-- 数据集：`dacongming666/airbot_play_data`
-- 权重：  `dacongming666/pi05_airbot_play`
-
-### 4.2 上传（数据/权重的产出方执行）
 ```bash
-hf auth login                  # 用 Write 权限的 token
-
-# 数据集（整个 lerobot 文件夹）
-hf upload dacongming666/airbot_play_data "$HF_LEROBOT_HOME/airbot_play_data" . --repo-type dataset
-
-# 权重：进入要分发的 checkpoint 目录，排除 train_state（推理用不到，且体积大）
-cd checkpoints/pi05_airbot_play/my_experiment/22000
-hf upload dacongming666/pi05_airbot_play . --exclude "train_state/*"
-```
-
-### 4.3 下载
-```bash
-# 服务器下载数据集到 HF_LEROBOT_HOME（见第 5.2 节）
-hf download dacongming666/airbot_play_data --repo-type dataset \
-  --local-dir "$HF_LEROBOT_HOME/airbot_play_data"
-
-# 本地下载权重用于推理
-hf download dacongming666/pi05_airbot_play \
-  --local-dir ./checkpoints/pi05_airbot_play/my_experiment/22000
-```
-
----
-
-## 5. 完整流程
-
-### 5.1 采集数据（本地，conda 环境）
-确保机械臂上电、双臂 gRPC 服务已启动、两台相机已连接，然后：
-```bash
-conda activate openpi_airbot
+# Collect (local)
 python airbot/collect_data.py --task "pick up the block and place it in the bowl"
-```
-- 按 `Enter` 开始录一条 episode，遥操作 Lead 臂演示，再按 `Enter` 保存（`d` 丢弃），`q` 结束并自动存为 LeRobot 格式。
-- 数据保存在 `$HF_LEROBOT_HOME/airbot_play_data`（默认 `~/.cache/huggingface/lerobot/`）。
-- 采完按第 4.2 节上传到 HuggingFace。
 
-### 5.2 训练（服务器，uv 环境）
-```bash
-# 1) 指定数据集根目录（放在大数据盘，避免塞满系统盘）
-mkdir -p /path/to/bigdisk/data
+# Train (server)
 export HF_LEROBOT_HOME=/path/to/bigdisk/data
-#    然后把数据集放到 $HF_LEROBOT_HOME/airbot_play_data（下载或拷贝）
-
-# 2) 修复 parquet 元数据兼容性（List -> Sequence）
-uv run python scripts/repack_dataset.py        # 自动读取 HF_LEROBOT_HOME
-
-# 3) 计算归一化统计量
 uv run scripts/compute_norm_stats.py --config-name pi05_airbot_play
+uv run scripts/train.py pi05_airbot_play --exp-name=run1 --num-train-steps=30000 --batch-size=8
 
-# 4) 训练（LoRA 微调，配置见 src/openpi/training/config.py 的 pi05_airbot_play）
-uv run scripts/train.py pi05_airbot_play --exp-name=test_run --num-train-steps=30000 --batch-size=8
+# Infer (local) — dry-run first
+python local_inference.py --checkpoint ./checkpoints/pi05_airbot_play/run1/30000 \
+  --task "pick up the block and place it in the bowl" --dry-run
 ```
-- 训练基础权重 `pi05_base` 会自动从 `gs://openpi-assets` 下载（需联网）。
-- 输出权重在 `checkpoints/pi05_airbot_play/<exp-name>/<step>/`，含归一化统计 `assets/`。
-- 训练完按第 4.2 节上传权重。
-
-> `HF_LEROBOT_HOME` 是 lerobot 存放数据集的根目录。采集、repack、训练三处都按它定位数据集，所以**训练前必须先 export**。
-
-### 5.3 推理（本地，conda 环境）
-```bash
-conda activate openpi_airbot
-
-# 先 dry-run：只推理打印、不发运动指令（仍会连机械臂和相机）
-python local_inference.py \
-  --checkpoint ./checkpoints/pi05_airbot_play/my_experiment/22000 \
-  --task "pick up the block and place it in the bowl" \
-  --steps 5 --freq 5 --dry-run
-
-# 确认预测正常后，去掉 --dry-run 真机运行
-python local_inference.py \
-  --checkpoint ./checkpoints/pi05_airbot_play/my_experiment/22000 \
-  --task "pick up the block and place it in the bowl"
-```
-**安全**：有显示窗口时按 `q` / `Esc` 急停并回零位；无窗口时（`--no-display`）在终端输入 `q` 回车急停。`--min-z` 设末端最低高度防止压台面。
+Safety: `q`/`Esc` (or `q`+Enter with `--no-display`) stops and returns to zero;
+`--min-z` caps the lowest end-effector height.
 
 ---
 
-## 6. 测试后清理
+## 5. Pipeline B — task space (EEF), UMI + teleop co-training
 
+The goal: collect a new skill cheaply with a **handheld UMI gripper** and inject
+it into the robot, co-trained with AIRBOT teleop data, by mapping both sources
+into **one shared task-space representation**.
+
+### 5.1 Shared representation
+Every sample (UMI and teleop) is converted to the same schema:
+
+- **state / action = 10D = `pos(3) + rot6d(6) + gripper(1)`**, expressed in a
+  per-episode relative frame **W′** (origin = first-frame fingertip, z = gravity,
+  first-frame yaw zeroed; pitch/roll kept gravity-absolute). This makes both
+  sources "rootless" and embodiment-agnostic.
+- **gripper** normalized by the robot's max opening (÷0.073, clip [0,1]); 0 = closed.
+  The action channel uses the **lead/commanded** gripper so grasps express
+  closing force (not just the achieved width).
+- **two camera slots**: `wrist_image` (always valid) and `image` (env/head camera).
+- **`env_mask`**: 1 = env camera valid (teleop), 0 = masked (UMI has no global
+  camera). This lets a single policy co-train across heterogeneous sensor sets.
+- **camera FOV match**: UMI's fisheye is de-fisheyed to ~79° to match the D405's 78.6°.
+
+### 5.2 Steps
 ```bash
-conda deactivate
-conda env remove -n openpi_airbot          # 删 conda 环境
-rm -rf .venv                               # 删 uv 环境（如有）
-# 模型缓存（跨项目共享，按需清理）：
-du -sh ~/.cache/openpi ~/.cache/huggingface
+# (a) Collect teleop EEF data — records base-frame EEF (pos+quat+gripper) via the
+#     vendor FK get_end_pose. First calibrate the lead gripper range once:
+python airbot/collect_data.py --task x --print-grip            # read lead full-open value
+python airbot/collect_data.py --task "pick up the block and place it in the bowl" \
+  --lead-gripper-max 0.049 --output-dir /home/you/pi_data --repo-id airbot_play_data
+python airbot/collect_data.py --task "wipe the blackboard" \
+  --lead-gripper-max 0.049 --output-dir /home/you/pi_data --repo-id airbot_wipe_data
+
+# (b) Pack UMI mcaps + (one or more) teleop datasets into one EEF dataset.
+#     Each teleop episode's prompt is read automatically from its source tasks.jsonl;
+#     datasets-v4 "List" feature type is auto-downgraded for server compatibility.
+python umi/pack_lerobot.py \
+  --umi-dir /path/to/umi_mcaps \
+  --teleop-dir /home/you/pi_data/airbot_play_data /home/you/pi_data/airbot_wipe_data \
+  -o /home/you/pi_data/cotrain_eef --repo-id cotrain_eef --verify
+#   (--skip-umi packs teleop only, for the ablation config pi05_teleop_eef)
+
+# (c) Train (server)
+uv run scripts/compute_norm_stats.py --config-name pi05_cotrain_eef
+uv run scripts/train.py pi05_cotrain_eef --exp-name cotrain_v1
+
+# (d) Deploy (local). env-mask=1 uses the head camera (recommended once the task
+#     has teleop data); single-camera UMI-only tasks use env-mask=0.
+python local_inference_eef.py --checkpoint ./checkpoints/pi05_cotrain_eef/cotrain_v1/17000 \
+  --task "pick up the block and place it in the bowl" --env-mask 1 \
+  --speed-profile fast --speed-scale 0.3
 ```
+
+### 5.3 Offline open-loop eval (no robot)
+Validate that the model actually learned an episode by feeding recorded
+observations and comparing predicted vs ground-truth actions (a low flow-matching
+loss does **not** guarantee good sampled actions):
+```bash
+python eval_eef_offline.py --checkpoint <ckpt> --dataset /home/you/pi_data/cotrain_eef \
+  --task-filter "block" --plot eval_block.png
+#  --force-env-mask 0/1 to probe sensitivity to the env-camera mask
+```
+
+> Deployment is closed-loop: the model is re-queried each chunk from the live
+> `get_end_pose`, which is self-correcting. Note that a wrongly-actuated gripper
+> dimension feeds back into the observed state and corrupts pose prediction too —
+> so the gripper denormalization and lead-gripper action source matter for the
+> whole policy, not just the gripper.
 
 ---
 
-## 仓库中本项目新增/修改的关键文件
-| 路径 | 说明 |
-|------|------|
-| [airbot/collect_data.py](airbot/collect_data.py) | 遥操作 + 双相机采集 → LeRobot 数据集 |
-| [airbot/play_sdk.py](airbot/play_sdk.py) | AIRBOT Play 机械臂 + 相机封装 |
-| [airbot/play_config.json](airbot/play_config.json) | 端口 + 相机序列号配置 |
-| [local_inference.py](local_inference.py) | 本地实时推理脚本 |
-| `src/openpi/policies/airbot_play_policy.py` | airbot 数据 ↔ 模型输入输出变换 |
-| `src/openpi/training/config.py` | 训练配置 `pi05_airbot_play` |
-| `scripts/repack_dataset.py` | parquet 元数据兼容性修复 |
+## 6. Datasets & weights (HuggingFace)
+
+Datasets and fine-tuned weights are **not** in git.
+```bash
+hf auth login
+hf upload <user>/<dataset> "$HF_LEROBOT_HOME/<dataset>" . --repo-type dataset
+cd checkpoints/<config>/<exp>/<step> && hf upload <user>/<weights> . --exclude "train_state/*"
+```
+`HF_LEROBOT_HOME` is the LeRobot dataset root; collection, packing and training
+all resolve datasets relative to it, so export it before training.
+
+---
+
+## 7. Key files
+| Path | Purpose |
+|---|---|
+| [airbot/collect_data.py](airbot/collect_data.py) | Teleop + dual-camera collection → LeRobot (joint 7D **and** base-frame EEF 8D); lead→follow gripper rescaling. |
+| [airbot/play_sdk.py](airbot/play_sdk.py) | AIRBOT Play arm + camera wrapper. |
+| [airbot/play_config.json](airbot/play_config.json) | Ports, camera serials, workspace bounds. |
+| [umi/umi_to_lerobot.py](umi/umi_to_lerobot.py) | UMI mcap → de-fisheyed video + W′ pose + gripper-norm. |
+| [umi/pack_lerobot.py](umi/pack_lerobot.py) | Stage-4 packer: UMI + teleop → one shared EEF dataset. |
+| [umi/replay_check.py](umi/replay_check.py) | Real-robot replay validation of the coordinate chain. |
+| [local_inference.py](local_inference.py) | Joint-space real-time inference (Pipeline A). |
+| [local_inference_eef.py](local_inference_eef.py) | Task-space (EEF) real-time inference (Pipeline B). |
+| [eval_eef_offline.py](eval_eef_offline.py) | Offline open-loop eval (predicted vs GT actions). |
+| `src/openpi/policies/airbot_eef_policy.py` | EEF data ↔ model transforms (10D state, env_mask). |
+| `src/openpi/training/config.py` | Configs `pi05_airbot_play`, `pi05_cotrain_eef`, `pi05_teleop_eef`. |
+
+---
+
+## 8. Cleanup
+```bash
+conda env remove -n openpi_airbot
+rm -rf .venv
+du -sh ~/.cache/openpi ~/.cache/huggingface   # shared caches, clear as needed
+```
