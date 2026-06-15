@@ -152,6 +152,17 @@ def process_umi_episode(mcap_path, tcp_offset, R_align, robot_gripper_max,
 # ---------------------------------------------------------------------------
 # 遥操作：LeRobot episode -> 帧序列
 # ---------------------------------------------------------------------------
+def load_source_tasks(troot):
+    """读遥操作源数据集的 meta/tasks.jsonl -> {task_index: task串}。"""
+    tasks = {}
+    f = troot / "meta" / "tasks.jsonl"
+    if f.exists():
+        for line in f.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                d = json.loads(line); tasks[int(d["task_index"])] = d["task"]
+    return tasks
+
+
 def read_video_frames(mp4_path):
     """mp4 -> list of HxWx3 RGB。"""
     cap = cv2.VideoCapture(str(mp4_path))
@@ -172,15 +183,25 @@ def process_teleop_episode(parquet, img_mp4, wrist_mp4, robot_gripper_max):
     if "state_eef" not in t:
         print(f"  ✗ {parquet.name}: 无 state_eef（旧格式?）, 跳过")
         return None
-    se = np.array(t["state_eef"], dtype=np.float64)   # (N,8) pos3+quat4(xyzw)+grip(m)
+    task_index = int(t["task_index"][0]) if "task_index" in t else None
+    se = np.array(t["state_eef"], dtype=np.float64)   # (N,8) pos3+quat4(xyzw)+follow(实际)grip
     pos_base = se[:, :3]
     quat = se[:, 3:7]
-    grip_m = se[:, 7]
+    grip_follow = se[:, 7]
     R_tool = np.stack([quat_to_rot(*q) for q in quat])    # 已是工具系(base)
 
     pos, rot6d = build_wprime(pos_base, R_tool)
-    grip01 = np.clip(grip_m / robot_gripper_max, 0.0, 1.0).astype(np.float32)
-    state, action = make_state_action(pos, rot6d, grip01)
+    grip_state = np.clip(grip_follow / robot_gripper_max, 0.0, 1.0).astype(np.float32)
+    state, action = make_state_action(pos, rot6d, grip_state)
+    # 关键修正: 动作夹爪改用 lead(遥操作指令)夹爪。follow(实际)抓取时只能闭到积木宽度、
+    # 表达不出"夹紧力", 模型学了就会"贴着积木宽度但不夹住"。lead 抓取时→~0, 才会真夹紧。
+    if "actions_eef" in t:
+        ae = np.array(t["actions_eef"], dtype=np.float64)   # (N,8) lead pose + lead(指令)grip
+        grip_lead = np.clip(ae[:, 7] / robot_gripper_max, 0.0, 1.0).astype(np.float32)
+        m = min(len(action), len(grip_lead))
+        action[:m, 9] = grip_lead[:m]                       # 只换动作的夹爪维, 位姿仍用 next-state(已验证)
+    else:
+        print(f"  ⚠ {parquet.name}: 无 actions_eef, 动作夹爪退回 follow(可能夹不紧)")
 
     env = read_video_frames(img_mp4)
     wrist = read_video_frames(wrist_mp4)
@@ -191,7 +212,7 @@ def process_teleop_episode(parquet, img_mp4, wrist_mp4, robot_gripper_max):
     return {"wrist": [cv2.resize(w, (OUT_W, OUT_H)) for w in wrist[:n]],
             "env": [cv2.resize(e, (OUT_W, OUT_H)) for e in env[:n]],
             "state": state[:n], "actions": action[:n],
-            "env_mask": np.ones(n, np.float32)}
+            "env_mask": np.ones(n, np.float32), "task_index": task_index}
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +242,30 @@ def create_dataset(out_dir, repo_id):
     )
 
 
+def make_server_compatible(out_dir):
+    """把本地 datasets>=4.0 写的特征类型 'List' 降级为 'Sequence'，
+    让服务器(datasets 3.x / lerobot 0.1.0)能直接读。打包末尾自动调用——
+    保持“一个脚本出可直接训练的数据集”，不另开脚本。只改 schema 元数据，不动数据。"""
+    import pyarrow.parquet as pq
+    n = 0
+    for pf in sorted((out_dir / "data").rglob("*.parquet")):
+        t = pq.read_table(pf)
+        md = dict(t.schema.metadata or {})
+        ch = False
+        for k, v in list(md.items()):
+            if b'"List"' in v:
+                md[k] = v.replace(b'"List"', b'"Sequence"'); ch = True
+        if ch:
+            pq.write_table(t.replace_schema_metadata(md), pf); n += 1
+    info = out_dir / "meta" / "info.json"
+    if info.exists():
+        s = info.read_text(encoding="utf-8")
+        if '"List"' in s:
+            info.write_text(s.replace('"List"', '"Sequence"'), encoding="utf-8")
+    if n:
+        print(f"  ✓ 兼容处理: {n} 个 parquet 特征类型 List->Sequence (服务器 datasets 3.x 可读)")
+
+
 def write_episode(dataset, ep, task):
     for i in range(len(ep["state"])):
         dataset.add_frame({
@@ -236,12 +281,16 @@ def write_episode(dataset, ep, task):
 
 def main():
     ap = argparse.ArgumentParser(description="阶段4: UMI + 遥操作 -> 统一联合训练 LeRobot")
-    ap.add_argument("--umi-dir", required=True, help="UMI VIO mcap 目录")
-    ap.add_argument("--teleop-dir", required=True, help="遥操作 LeRobot 数据集根目录")
+    ap.add_argument("--umi-dir", default=None, help="UMI VIO mcap 目录（--skip-umi 时可省）")
+    ap.add_argument("--teleop-dir", required=True, nargs="+",
+                    help="遥操作 LeRobot 数据集根目录(可传多个, 如积木目录 擦黑板目录)")
+    ap.add_argument("--skip-umi", action="store_true",
+                    help="只打包遥操作（测试③：纯遥操作 EEF，头部相机全程有效）")
     ap.add_argument("-o", "--output", required=True, help="输出合并数据集目录")
     ap.add_argument("--repo-id", default="cotrain_eef")
     ap.add_argument("--umi-task", default="wipe the blackboard")
-    ap.add_argument("--teleop-task", default="pick up the block and place it in the bowl")
+    ap.add_argument("--teleop-task", default=None,
+                    help="覆盖所有 teleop 的 prompt; 默认 None=从各源 tasks.jsonl 按 task_index 自动读")
     ap.add_argument("--tcp-offset", nargs=3, type=float, default=list(DEFAULT_TCP_OFFSET))
     ap.add_argument("--align-rpy", nargs=3, type=float, default=list(DEFAULT_ALIGN_RPY))
     ap.add_argument("--robot-gripper-max", type=float, default=DEFAULT_ROBOT_GRIPPER_MAX)
@@ -257,10 +306,14 @@ def main():
     stats = {"umi": [0, 0], "teleop": [0, 0]}   # [episodes, frames]
 
     # ---- UMI ----
-    umi_mcaps = sorted(Path(args.umi_dir).expanduser().glob("*.mcap"))
-    if args.limit:
-        umi_mcaps = umi_mcaps[:args.limit]
-    print(f"\n=== UMI: {len(umi_mcaps)} 条 ===")
+    if args.skip_umi or not args.umi_dir:
+        umi_mcaps = []
+        print("\n=== UMI: 跳过 (--skip-umi) ===")
+    else:
+        umi_mcaps = sorted(Path(args.umi_dir).expanduser().glob("*.mcap"))
+        if args.limit:
+            umi_mcaps = umi_mcaps[:args.limit]
+        print(f"\n=== UMI: {len(umi_mcaps)} 条 ===")
     for m in umi_mcaps:
         ep = process_umi_episode(m, args.tcp_offset, R_align,
                                  args.robot_gripper_max, args.target_hfov)
@@ -270,24 +323,34 @@ def main():
         stats["umi"][0] += 1; stats["umi"][1] += len(ep["state"])
         print(f"  ✓ {m.name}: {len(ep['state'])} 帧")
 
-    # ---- 遥操作 ----
-    troot = Path(args.teleop_dir).expanduser()
-    pqs = sorted((troot / "data").rglob("episode_*.parquet"))
-    if args.limit:
-        pqs = pqs[:args.limit]
-    print(f"\n=== 遥操作: {len(pqs)} 条 ===")
-    for pqf in pqs:
-        stem = pqf.stem
-        img_mp4 = troot / "videos" / pqf.parent.name / "image" / f"{stem}.mp4"
-        wrist_mp4 = troot / "videos" / pqf.parent.name / "wrist_image" / f"{stem}.mp4"
-        if not img_mp4.exists() or not wrist_mp4.exists():
-            print(f"  ✗ {stem}: 缺视频, 跳过"); continue
-        ep = process_teleop_episode(pqf, img_mp4, wrist_mp4, args.robot_gripper_max)
-        if ep is None:
-            continue
-        write_episode(dataset, ep, args.teleop_task)
-        stats["teleop"][0] += 1; stats["teleop"][1] += len(ep["state"])
-        print(f"  ✓ {stem}: {len(ep['state'])} 帧")
+    # ---- 遥操作(可多个目录; prompt 默认从各源 tasks.jsonl 按 task_index 自动读) ----
+    troots = [Path(d).expanduser() for d in args.teleop_dir]
+    print(f"\n=== 遥操作: {len(troots)} 个目录 ===")
+    for troot in troots:
+        src_tasks = load_source_tasks(troot)
+        pqs = sorted((troot / "data").rglob("episode_*.parquet"))
+        if args.limit:
+            pqs = pqs[:args.limit]
+        print(f"  [{troot.name}] {len(pqs)} 条  源 tasks={list(src_tasks.values())}")
+        for pqf in pqs:
+            stem = pqf.stem
+            img_mp4 = troot / "videos" / pqf.parent.name / "image" / f"{stem}.mp4"
+            wrist_mp4 = troot / "videos" / pqf.parent.name / "wrist_image" / f"{stem}.mp4"
+            if not img_mp4.exists() or not wrist_mp4.exists():
+                print(f"    ✗ {stem}: 缺视频, 跳过"); continue
+            ep = process_teleop_episode(pqf, img_mp4, wrist_mp4, args.robot_gripper_max)
+            if ep is None:
+                continue
+            # prompt: --teleop-task 覆盖优先, 否则按本条 task_index 从源 tasks.jsonl 读
+            task = args.teleop_task
+            if task is None:
+                ti = ep.get("task_index")
+                task = src_tasks.get(ti) if ti is not None else None
+                if task is None:
+                    print(f"    ✗ {stem}: 源无 task(index={ti}), 跳过"); continue
+            write_episode(dataset, ep, task)
+            stats["teleop"][0] += 1; stats["teleop"][1] += len(ep["state"])
+            print(f"    ✓ {stem}: {len(ep['state'])} 帧  task='{task}'")
 
     uf, tf = stats["umi"][1], stats["teleop"][1]
     tot = uf + tf
@@ -296,6 +359,8 @@ def main():
     print(f"  遥操作: {stats['teleop'][0]} 条 / {tf} 帧 ({tf/max(tot,1)*100:.0f}%)")
     print(f"  真实混合比例(按帧) UMI:遥操作 = {uf}:{tf} ≈ {uf/max(tf,1):.2f}:1")
     print(f"  输出: {out_dir}")
+
+    make_server_compatible(out_dir)   # 自动降级 List->Sequence, 服务器可直接训练
 
     if args.verify:
         verify_dataset(out_dir, args.repo_id)

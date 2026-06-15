@@ -1066,6 +1066,32 @@ _CONFIGS = [
         ema_decay=None,
     ),
     #
+    # 测试③：只用遥操作的 EEF（隔离“EEF 表示 vs 协同稀释”）。与 pi05_cotrain_eef
+    # 完全相同，仅 repo_id 换成 teleop_eef（无 UMI、头部相机全程有效）。
+    #
+    TrainConfig(
+        name="pi05_teleop_eef",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotAirbotEEFDataConfig(
+            repo_id="teleop_eef",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
     # Debugging configs.
     #
     TrainConfig(

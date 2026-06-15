@@ -70,8 +70,9 @@ class EEFInferenceRunner:
     def __init__(self, checkpoint_dir, port, task, head_serial, wrist_serial,
                  servo_hz, speed_profile, speed_scale, chunk_execute,
                  env_mask, min_z, max_step_mm, dry_run, no_display, config_path,
-                 start_joint=None):
+                 start_joint=None, config_name="pi05_cotrain_eef"):
         self.task = task or "do something"
+        self.config_name = config_name
         self.servo_hz = servo_hz
         self.speed_profile = speed_profile
         self.speed_scale = speed_scale
@@ -86,8 +87,8 @@ class EEFInferenceRunner:
         self._stop = False
         self._vis = None
 
-        print(">>> [1/4] 加载模型 (pi05_cotrain_eef)...", flush=True)
-        self.cfg = _config.get_config("pi05_cotrain_eef")
+        print(f">>> [1/4] 加载模型 ({self.config_name})...", flush=True)
+        self.cfg = _config.get_config(self.config_name)
         self.policy = _policy_config.create_trained_policy(
             self.cfg, pathlib.Path(checkpoint_dir), default_prompt=self.task)
         print(">>> [2/4] 模型加载完成", flush=True)
@@ -187,7 +188,10 @@ class EEFInferenceRunner:
                 q = nlerp(q0, q1, a)
                 if p[2] >= self.min_z:
                     self.robot.servo_cart_pose(p.tolist(), q.tolist())
-                self.robot.left._robot.servo_eef_pos([(1 - a) * g0 + a * g1])
+                # 反归一化: 模型输出是 [0,1](训练时 ÷GRIPPER_MAX),发给 SDK 前要 ×GRIPPER_MAX
+                # 还原成夹爪原始单位; 否则 0.3~0.7 会被钳成"全开",细腻闭合全丢。
+                g_cmd = ((1 - a) * g0 + a * g1) * GRIPPER_MAX
+                self.robot.left._robot.servo_eef_pos([g_cmd])
                 self._poll_stop()
                 if self._stop:
                     return
@@ -288,6 +292,8 @@ def main():
                     help="起始关节构型(6值)；不给则在当前位姿建 W'(请手动摆到训练开局姿态)")
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--timeout", type=float, default=None)
+    ap.add_argument("--config-name", default="pi05_cotrain_eef",
+                    help="训练配置名: 协同=pi05_cotrain_eef; 测试③纯遥操作=pi05_teleop_eef")
     ap.add_argument("--dry-run", action="store_true", help="只推理+打印,不发运动")
     ap.add_argument("--no-display", action="store_true")
     args = ap.parse_args()
@@ -300,7 +306,7 @@ def main():
         speed_scale=args.speed_scale, chunk_execute=args.chunk,
         env_mask=args.env_mask, min_z=args.min_z, max_step_mm=args.max_step_mm,
         dry_run=args.dry_run, no_display=args.no_display, config_path=args.play_config,
-        start_joint=args.start_joint,
+        start_joint=args.start_joint, config_name=args.config_name,
     )
     runner.run(num_steps=args.steps, timeout=args.timeout)
 

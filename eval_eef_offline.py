@@ -30,17 +30,25 @@ import numpy as np
 import pyarrow.parquet as pq
 
 _ROOT = pathlib.Path(__file__).parent
-sys.path.insert(0, str(_ROOT / "airbot"))
-sys.path.insert(0, str(_ROOT / "umi"))
 
 from openpi.policies import policy_config as _policy_config   # noqa: E402
 from openpi.training import config as _config                 # noqa: E402
-from umi_to_lerobot import rot6d_to_rot                        # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
 # 工具
 # --------------------------------------------------------------------------- #
+def rot6d_to_rot(d6):
+    """6D -> 旋转矩阵（Gram-Schmidt）。与 umi_to_lerobot.rot6d_to_rot 完全一致，
+    内联在此以避免在服务器上拖入 mcap 依赖。"""
+    d6 = np.asarray(d6, dtype=np.float64)
+    a, b = d6[:3], d6[3:]
+    x = a / np.linalg.norm(a)
+    b = b - x * (x @ b)
+    y = b / np.linalg.norm(b)
+    return np.stack([x, y, np.cross(x, y)], axis=1)
+
+
 def geodesic_deg(r6_a, r6_b):
     """两个 6D 旋转之间的测地角(度)。"""
     Ra, Rb = rot6d_to_rot(np.asarray(r6_a)), rot6d_to_rot(np.asarray(r6_b))
@@ -97,6 +105,8 @@ def main():
     ap.add_argument("--config-name", default="pi05_cotrain_eef")
     ap.add_argument("--episode-index", type=int, default=None, help="第几条 parquet(按排序)")
     ap.add_argument("--task-filter", default=None, help="按任务串选 episode, 如 'block' / 'wipe'")
+    ap.add_argument("--force-env-mask", type=float, default=None,
+                    help="强制覆盖 env_mask(0/1)，用于验证“env_mask=0 会触发 UMI 先验”假设")
     ap.add_argument("--stride", type=int, default=3, help="每隔几帧评一次(省时间)")
     ap.add_argument("--max-frames", type=int, default=None, help="最多评多少个采样点")
     ap.add_argument("--plot", default=None, help="保存预测vs真值对比图(png)")
@@ -156,12 +166,17 @@ def main():
     stay_errs = {"pos": [], "rot": [], "grip": []}     # 基线: pred=当前 state
     traj_pred0, traj_gt0 = [], []                      # 画图: 每帧 horizon-0 的下一位姿
 
+    em_used = args.force_env_mask if args.force_env_mask is not None else None
+    if em_used is not None:
+        print(f">>> ⚠️ 强制 env_mask = {em_used}（覆盖数据集里的 {env_mask[0]:.0f}）")
+
     for j, t in enumerate(rows):
+        em_t = em_used if em_used is not None else env_mask[t]
         obs = {
             "observation/image": env_frames[t].astype(np.uint8),
             "observation/wrist_image": wrist_frames[t].astype(np.uint8),
             "observation/state": state[t],
-            "observation/env_mask": np.float32(env_mask[t]),
+            "observation/env_mask": np.float32(em_t),
             "prompt": task,
         }
         chunk = policy.infer(obs)["actions"]      # (H,10) W'
