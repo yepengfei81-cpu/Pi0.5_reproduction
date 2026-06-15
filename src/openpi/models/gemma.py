@@ -346,6 +346,8 @@ class Module(nn.Module):
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
     adarms: bool = False
+    # 梯度重计算策略名 (jax.checkpoint_policies 下的属性)。默认上游行为=全部重算。
+    remat_policy: str = "nothing_saveable"
 
     def setup(self):
         # all experts must have the same depth
@@ -360,7 +362,7 @@ class Module(nn.Module):
             Block,
             prevent_cse=False,
             static_argnums=(5,),  # 0=self, 6=deterministic
-            policy=jax.checkpoint_policies.nothing_saveable,
+            policy=getattr(jax.checkpoint_policies, self.remat_policy),
         )
         self.layers = nn.scan(
             block_cls,

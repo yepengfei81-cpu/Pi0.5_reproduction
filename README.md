@@ -130,12 +130,11 @@ Every sample (UMI and teleop) is converted to the same schema:
 ### 5.2 Steps
 ```bash
 # (a) Collect teleop EEF data — records base-frame EEF (pos+quat+gripper) via the
-#     vendor FK get_end_pose. First calibrate the lead gripper range once:
-python airbot/collect_data.py --task x --print-grip            # read lead full-open value
+#     vendor FK get_end_pose. The lead→follow gripper-range correction is built in.
 python airbot/collect_data.py --task "pick up the block and place it in the bowl" \
-  --lead-gripper-max 0.049 --output-dir /home/you/pi_data --repo-id airbot_play_data
+  --output-dir /home/you/pi_data --repo-id airbot_play_data
 python airbot/collect_data.py --task "wipe the blackboard" \
-  --lead-gripper-max 0.049 --output-dir /home/you/pi_data --repo-id airbot_wipe_data
+  --output-dir /home/you/pi_data --repo-id airbot_wipe_data
 
 # (b) Pack UMI mcaps + (one or more) teleop datasets into one EEF dataset.
 #     Each teleop episode's prompt is read automatically from its source tasks.jsonl;

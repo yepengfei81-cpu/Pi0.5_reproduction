@@ -20,6 +20,10 @@ class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     paligemma_variant: _gemma.Variant = "gemma_2b"
     action_expert_variant: _gemma.Variant = "gemma_300m"
+    # 主干 LLM 的梯度重计算(remat)策略, 直接传给 jax.checkpoint_policies。
+    # "nothing_saveable"(默认, 上游行为): 全部重算, 最省显存、最慢。
+    # "dots_saveable": 保存矩阵乘结果只重算便宜算子, 用富裕显存换 ~20-35% 速度(结果数学等价)。
+    llm_remat_policy: str = "nothing_saveable"
 
     # Set the model specific defaults.
     action_dim: int = 32

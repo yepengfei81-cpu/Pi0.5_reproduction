@@ -43,20 +43,18 @@ HEAD_CAMERA_SERIAL = "230422271972"
 WRIST_CAMERA_SERIAL = "230422271433"
 HOME_JOINT = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # 零位关节角
 
-# 夹爪量程对齐：lead(Replay 无动力臂)全开 < follow(Play)全开。
-# 不映射就会导致 follow 开不够宽、夹不起宽物体(如板擦)。
-# 先用 --print-grip 把 lead 完全张开/闭合各读一次, 把全开值填到 LEAD_GRIPPER_MAX。
-LEAD_GRIPPER_MAX = 0.05      # ←★测量后填: lead 完全张开时 get_eef_pos()[0]
-FOLLOW_GRIPPER_MAX = 0.073   # Play 夹爪完全张开值(全流程一致)
+# 夹爪量程对齐(固定修正)：厂家把 lead(Replay)和 follow(Play)夹爪的全开宽度设计得
+# 不一致(lead 更小)——本应一样,属于设计 bug。这里按一次性标定的全开值线性映射
+# lead->follow 修正它,让 follow 能张到自己的最大(否则夹不起板擦等宽物)。固定即可,无需每次标定。
+LEAD_GRIPPER_MAX = 0.049     # lead(Replay) 完全张开时 get_eef_pos()[0] (标定固定值)
+FOLLOW_GRIPPER_MAX = 0.073   # follow(Play) 完全张开值
 
 
-def lead_grip_to_follow(lead_g, lead_max=None, follow_max=None):
-    """把 lead 夹爪值线性映射到 follow 量程(两端对齐: 全闭→0, 全开→follow_max)。
+def lead_grip_to_follow(lead_g):
+    """把 lead 夹爪值线性映射到 follow 量程(两端对齐: 全闭→0, 全开→FOLLOW_GRIPPER_MAX)。
     映射后的值同时用于(a)下发给 follow, (b)存进 action/action_eef —— 保证训练里
     夹爪单位 = follow 物理单位, 与 state(follow) 一致, 打包 ÷0.073 归一化才正确。"""
-    lm = lead_max if lead_max is not None else LEAD_GRIPPER_MAX
-    fm = follow_max if follow_max is not None else FOLLOW_GRIPPER_MAX
-    return float(np.clip(lead_g * fm / max(lm, 1e-6), 0.0, fm))
+    return float(np.clip(lead_g * FOLLOW_GRIPPER_MAX / LEAD_GRIPPER_MAX, 0.0, FOLLOW_GRIPPER_MAX))
 
 
 def parse_args():
@@ -71,10 +69,6 @@ def parse_args():
                         help="输出目录 (默认 HF_LEROBOT_HOME)")
     parser.add_argument("--no-display", action="store_true",
                         help="禁用相机可视化窗口")
-    parser.add_argument("--lead-gripper-max", type=float, default=LEAD_GRIPPER_MAX,
-                        help=f"lead 夹爪完全张开时 get_eef_pos()[0] (默认 {LEAD_GRIPPER_MAX}); 用 --print-grip 测")
-    parser.add_argument("--print-grip", action="store_true",
-                        help="标定模式: 持续打印 lead/follow 夹爪读数, 手动全开/全闭 lead 读出量程后退出")
     return parser.parse_args()
 
 
@@ -396,9 +390,6 @@ def write_episode(dataset, frames, task):
 def main():
     args = parse_args()
 
-    global LEAD_GRIPPER_MAX
-    LEAD_GRIPPER_MAX = args.lead_gripper_max   # 命令行覆盖, 供 lead_grip_to_follow 使用
-
     from airbot_py.arm import AIRBOTArm, RobotMode, SpeedProfile
 
     # 连接双臂
@@ -413,23 +404,6 @@ def main():
         lead.disconnect()
         raise RuntimeError(f"无法连接 Follow 臂 (port={FOLLOW_PORT})")
     logger.info("Follow 臂 (Play) 已连接")
-
-    # 标定模式: 手动把 lead 完全张开/闭合, 读出量程, 填到 --lead-gripper-max
-    if args.print_grip:
-        logger.info("标定: 手动完全张开/闭合 lead 夹爪, 观察 lead 全开值 -> 填 --lead-gripper-max。Ctrl+C 退出")
-        try:
-            while True:
-                le = lead.get_eef_pos(); fe = follow.get_eef_pos()
-                lv = le[0] if le else float("nan"); fv = fe[0] if fe else float("nan")
-                print(f"  lead grip={lv:.4f}   follow grip={fv:.4f}   "
-                      f"(当前映射: lead全开{args.lead_gripper_max}->follow {FOLLOW_GRIPPER_MAX})",
-                      end="\r", flush=True)
-                time.sleep(0.05)
-        except KeyboardInterrupt:
-            print()
-        finally:
-            lead.disconnect(); follow.disconnect()
-        return
 
     # 连接相机
     cameras = DualCamera()

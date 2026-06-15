@@ -121,12 +121,11 @@ python local_inference.py --checkpoint ./checkpoints/pi05_airbot_play/run1/30000
 ### 5.2 步骤
 ```bash
 # (a) 采集遥操作 EEF 数据 —— 通过厂家 FK get_end_pose 记录 base 系末端(pos+quat+夹爪)。
-#     先标定一次 lead 夹爪量程:
-python airbot/collect_data.py --task x --print-grip            # 读 lead 全开值
+#     lead→follow 夹爪量程修正已内置(写死),无需标定。
 python airbot/collect_data.py --task "pick up the block and place it in the bowl" \
-  --lead-gripper-max 0.049 --output-dir /home/you/pi_data --repo-id airbot_play_data
+  --output-dir /home/you/pi_data --repo-id airbot_play_data
 python airbot/collect_data.py --task "wipe the blackboard" \
-  --lead-gripper-max 0.049 --output-dir /home/you/pi_data --repo-id airbot_wipe_data
+  --output-dir /home/you/pi_data --repo-id airbot_wipe_data
 
 # (b) 把 UMI mcap + (一个或多个)遥操作数据集打包成一个 EEF 数据集。
 #     每条遥操作 episode 的 prompt 自动从源 tasks.jsonl 读;

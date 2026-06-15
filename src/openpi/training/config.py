@@ -1050,6 +1050,7 @@ _CONFIGS = [
             action_horizon=10,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
+            llm_remat_policy="dots_saveable",   # 用富裕显存换训练速度(数学等价); OOM 就改回 nothing_saveable
         ),
         data=LeRobotAirbotEEFDataConfig(
             repo_id="cotrain_eef",
@@ -1076,6 +1077,7 @@ _CONFIGS = [
             action_horizon=10,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
+            llm_remat_policy="dots_saveable",   # 用富裕显存换训练速度(数学等价); OOM 就改回 nothing_saveable
         ),
         data=LeRobotAirbotEEFDataConfig(
             repo_id="teleop_eef",
