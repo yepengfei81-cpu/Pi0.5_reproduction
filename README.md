@@ -199,12 +199,45 @@ all resolve datasets relative to it, so export it before training.
 | [local_inference.py](local_inference.py) | Joint-space real-time inference (Pipeline A). |
 | [local_inference_eef.py](local_inference_eef.py) | Task-space (EEF) real-time inference (Pipeline B). |
 | [eval_eef_offline.py](eval_eef_offline.py) | Offline open-loop eval (predicted vs GT actions). |
-| `src/openpi/policies/airbot_eef_policy.py` | EEF data ↔ model transforms (10D state, env_mask). |
-| `src/openpi/training/config.py` | Configs `pi05_airbot_play`, `pi05_cotrain_eef`, `pi05_teleop_eef`. |
+| `src/openpi/policies/airbot_eef_policy.py` | EEF data ↔ model transforms (10D state, env_mask, optional gripper point cloud). |
+| `src/openpi/training/config.py` | Configs `pi05_airbot_play`, `pi05_cotrain_eef`, `pi05_teleop_eef`, `pi05_teleop_eef_grip`. |
+| [gripper_geom/](gripper_geom/) | Gripper-geometry toolkit (see §6). |
 
 ---
 
-## 8. Cleanup
+## 8. Roadmap — gripper-aware, cross-gripper training (in progress)
+
+The current research direction: **teach the policy to exploit a 1-DOF gripper's
+distinct functional regions** (e.g. the GET gripper's fingertip vs. rear) **and to
+co-train across heterogeneous grippers** (parallel / GET / Robotiq) in one model.
+
+Method (Option C): encode each gripper's CAD-sampled **point cloud (in the TCP /
+`get_end_pose` frame)** into one token via a small PointNet, splice it into the pi0
+prefix (`embed_prefix`). The action expert attends to it, so the policy can compose
+"where the TCP moves" with "where each region is" → uses the right region per task,
+and adapts when the gripper (token) changes. The geometry is **declarative & constant
+per gripper**, so existing datasets are retrofitted by tagging — no re-collection.
+
+Toolkit in [gripper_geom/](gripper_geom/):
+- `inspect_meshes.py` — confirm which URDF meshes are the gripper.
+- `build_parallel_descriptor.py` — assemble gripper meshes into the TCP frame via the
+  URDF joints, sample a point cloud + functional-region anchors, save a descriptor
+  `.npy`; `--tcp-rpy` aligns every gripper to one common convention (+X = approach, +Z = up).
+- `project_gripper_overlay.py` — project the cloud onto the live wrist camera (coarse sanity check).
+- `axis_check.py` — kinematically verify the `get_end_pose` tool-frame axes.
+
+Network changes (behind `Pi0Config.gripper_token`, default off → no behavior change):
+`gripper_pc` field on `Observation`, a `PointNetEncoder` in `pi0.py`, the prefix splice,
+and the descriptor injection in `AirbotEEFInputs`. Config `pi05_teleop_eef_grip` enables
+it for a parallel-only **regression A/B** (token on vs off should match on the
+gold-standard teleop data before mixing in other grippers).
+
+> Descriptor `.npy` files are gitignored (regenerable from CAD); copy them to the
+> server before training a `gripper_token` config.
+
+---
+
+## 9. Cleanup
 ```bash
 conda env remove -n openpi_airbot
 rm -rf .venv

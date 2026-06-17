@@ -25,6 +25,11 @@ class Pi0Config(_model.BaseModelConfig):
     # "dots_saveable": 保存矩阵乘结果只重算便宜算子, 用富裕显存换 ~20-35% 速度(结果数学等价)。
     llm_remat_policy: str = "nothing_saveable"
 
+    # 方案C: 夹爪几何 token。开启后把 TCP 系下的夹爪点云(P,3)经点云 encoder 编成 1 个
+    # token 拼进 prefix, 让模型按几何/功能区做动作、并支持跨夹爪混训。默认关(行为不变)。
+    gripper_token: bool = False
+    num_gripper_points: int = 512
+
     # Set the model specific defaults.
     action_dim: int = 32
     action_horizon: int = 50
@@ -84,6 +89,8 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                gripper_pc=(jax.ShapeDtypeStruct([batch_size, self.num_gripper_points, 3], jnp.float32)
+                            if self.gripper_token else None),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 

@@ -10,6 +10,7 @@ from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+import numpy as np
 from typing_extensions import override
 import tyro
 
@@ -404,6 +405,11 @@ class LeRobotAirbotPlayDataConfig(DataConfigFactory):
 class LeRobotAirbotEEFDataConfig(DataConfigFactory):
     """Data config for UMI + 遥操作 联合训练 (任务空间 EEF 10D, 由 umi/pack_lerobot.py 产出)。"""
 
+    # 方案C: 夹爪几何描述符 .npy 路径(gripper_geom/build_*.py 产出)。给了就注入 gripper_pc。
+    # 当前单把爪; 多把爪以后改成按来源映射。文件被 gitignore, 服务器上需自行放好。
+    gripper_pc_path: str | None = None
+    num_gripper_points: int = 512
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         # LeRobot 存储的 key -> 模型期望的 key (加 observation/ 前缀)；多带 env_mask
@@ -422,8 +428,18 @@ class LeRobotAirbotEEFDataConfig(DataConfigFactory):
             ]
         )
 
+        # 方案C: 加载夹爪几何描述符(若提供), 采样到固定 P 点, 注入每个样本
+        gripper_pc = None
+        if self.gripper_pc_path is not None:
+            d = np.load(self.gripper_pc_path, allow_pickle=True).item()
+            pc = np.asarray(d["points"], np.float32)
+            idx = np.random.default_rng(0).choice(
+                len(pc), self.num_gripper_points, replace=len(pc) < self.num_gripper_points)
+            gripper_pc = pc[idx]
+
         data_transforms = _transforms.Group(
-            inputs=[airbot_eef_policy.AirbotEEFInputs(model_type=model_config.model_type)],
+            inputs=[airbot_eef_policy.AirbotEEFInputs(
+                model_type=model_config.model_type, gripper_pc=gripper_pc)],
             outputs=[airbot_eef_policy.AirbotEEFOutputs()],
         )
         # 注意: EEF 用 W' 相对系(已去掉全局偏移), 且 rot6d 不适合做差分, 故不加
@@ -1079,6 +1095,37 @@ _CONFIGS = [
         ),
         data=LeRobotAirbotEEFDataConfig(
             repo_id="teleop_eef",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
+    # 方案C 回归测试：同 teleop_eef(纯遥操作)但开 gripper_token(单把爪=常量描述符)。
+    # 用来验证"加了夹爪 token 的网络"在纯遥操作金标准上不掉点; 不掉点再混 GET。
+    # 注意: gripper_geom/parallel.npy 被 gitignore, 服务器上要自行放到该路径。
+    #
+    TrainConfig(
+        name="pi05_teleop_eef_grip",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            gripper_token=True,
+            num_gripper_points=512,
+        ),
+        data=LeRobotAirbotEEFDataConfig(
+            repo_id="teleop_eef",
+            gripper_pc_path="gripper_geom/parallel.npy",
+            num_gripper_points=512,
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),

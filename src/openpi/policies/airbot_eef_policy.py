@@ -38,6 +38,9 @@ def _parse_image(image) -> np.ndarray:
 class AirbotEEFInputs(transforms.DataTransformFn):
     """EEF 任务空间输入: 10D state + 双相机(env 槽按 env_mask 决定是否有效)。"""
     model_type: _model.ModelType = _model.ModelType.PI0
+    # 方案C: 夹爪几何点云 (P,3) (TCP 系)。None=不用 gripper token。
+    # 当前单把爪: 所有样本注入同一份描述符; 将来多把爪改为按 observation/gripper_id 查表。
+    gripper_pc: np.ndarray | None = None
 
     def __call__(self, data: dict) -> dict:
         base_image = _parse_image(data["observation/image"])
@@ -61,6 +64,9 @@ class AirbotEEFInputs(transforms.DataTransformFn):
                 "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
             },
         }
+
+        if self.gripper_pc is not None:
+            inputs["gripper_pc"] = np.asarray(self.gripper_pc, np.float32)
 
         if "actions" in data:
             inputs["actions"] = data["actions"]

@@ -99,6 +99,9 @@ class Observation(Generic[ArrayT]):
     # Tokenized prompt mask.
     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # 方案C: 夹爪几何点云(TCP 系, P 个点), 用于 gripper-aware token。None=不使用。
+    gripper_pc: at.Float[ArrayT, "*b p 3"] | None = None
+
     # pi0-fast model specific fields.
 
     # Token auto-regressive mask (for FAST autoregressive model).
@@ -126,6 +129,7 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            gripper_pc=data.get("gripper_pc"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -205,6 +209,7 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        gripper_pc=observation.gripper_pc,
     )
 
 

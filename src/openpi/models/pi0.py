@@ -63,6 +63,23 @@ def posemb_sincos(
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
 
+class PointNetEncoder(nnx.Module):
+    """方案C: 把夹爪点云 (b,p,3) 编成 1 个 token (b,1,emb)。
+    逐点共享 MLP + 对称 max-pool(置换不变, 点序无关)-> 投到 backbone 宽度。"""
+
+    def __init__(self, out_dim: int, rngs: nnx.Rngs, hidden: int = 256):
+        self.l1 = nnx.Linear(3, hidden, rngs=rngs)
+        self.l2 = nnx.Linear(hidden, hidden, rngs=rngs)
+        self.l3 = nnx.Linear(hidden, out_dim, rngs=rngs)
+
+    def __call__(self, pc: at.Float[at.Array, "b p 3"]) -> at.Float[at.Array, "b 1 e"]:
+        x = jax.nn.gelu(self.l1(pc))       # (b,p,h)
+        x = jax.nn.gelu(self.l2(x))        # (b,p,h)
+        x = jnp.max(x, axis=1)             # (b,h) 对称池化
+        tok = self.l3(x)                   # (b,emb)
+        return tok[:, None, :]             # (b,1,emb) 一个 token
+
+
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
@@ -90,6 +107,8 @@ class Pi0(_model.BaseModel):
         )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
+        if config.gripper_token:
+            self.gripper_encoder = PointNetEncoder(paligemma_config.width, rngs=rngs)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -132,6 +151,14 @@ class Pi0(_model.BaseModel):
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+
+        # 方案C: 夹爪几何 token(和图像/文本同档: 全注意力)
+        if obs.gripper_pc is not None:
+            g_tok = self.gripper_encoder(obs.gripper_pc)          # (b, 1, emb)
+            tokens.append(g_tok)
+            input_mask.append(jnp.ones((g_tok.shape[0], g_tok.shape[1]), dtype=jnp.bool_))
+            ar_mask += [False] * g_tok.shape[1]
+
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)

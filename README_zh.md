@@ -185,12 +185,39 @@ cd checkpoints/<config>/<exp>/<step> && hf upload <user>/<weights> . --exclude "
 | [local_inference.py](local_inference.py) | 关节空间实时推理(管线 A)。 |
 | [local_inference_eef.py](local_inference_eef.py) | 任务空间(EEF)实时推理(管线 B)。 |
 | [eval_eef_offline.py](eval_eef_offline.py) | 离线开环评测(预测 vs 真值动作)。 |
-| `src/openpi/policies/airbot_eef_policy.py` | EEF 数据 ↔ 模型变换(10D state、env_mask)。 |
-| `src/openpi/training/config.py` | 配置 `pi05_airbot_play`、`pi05_cotrain_eef`、`pi05_teleop_eef`。 |
+| `src/openpi/policies/airbot_eef_policy.py` | EEF 数据 ↔ 模型变换(10D state、env_mask、可选夹爪点云)。 |
+| `src/openpi/training/config.py` | 配置 `pi05_airbot_play`、`pi05_cotrain_eef`、`pi05_teleop_eef`、`pi05_teleop_eef_grip`。 |
+| [gripper_geom/](gripper_geom/) | 夹爪几何工具(见 §6)。 |
 
 ---
 
-## 8. 测试后清理
+## 8. 路线图 — gripper-aware 跨夹爪训练(进行中)
+
+当前研究方向:**教策略利用 1-DOF 夹爪的不同功能区**(如 GET 的指尖 vs 后部),
+并**在一个模型里跨异构夹爪(平行 / GET / Robotiq)混训**。
+
+方法(方案C):把每把爪 CAD 采样的**点云(在 TCP / `get_end_pose` 系)**用一个小 PointNet
+编成 1 个 token,拼进 pi0 的 prefix(`embed_prefix`)。动作专家会 attend 它,于是策略能把
+"TCP 往哪动"和"各功能区在哪"组合起来 → **按任务用对区域**,并在**换夹爪(换 token)时自动适应**。
+几何是**声明式、每把爪常量**,所以已采数据**贴标签即可 retrofit,无需重采**。
+
+工具在 [gripper_geom/](gripper_geom/):
+- `inspect_meshes.py` — 确认 URDF 里哪些 mesh 是夹爪。
+- `build_parallel_descriptor.py` — 按 URDF 关节把夹爪 mesh 装配到 TCP 系,采点云 + 功能区
+  锚点,存描述符 `.npy`;`--tcp-rpy` 把每把爪对齐到**统一约定**(+X 伸出、+Z 上)。
+- `project_gripper_overlay.py` — 把点云投到手眼相机实时画面(粗略 sanity check)。
+- `axis_check.py` — 运动学验证 `get_end_pose` 工具系轴向。
+
+网络改动(由 `Pi0Config.gripper_token` 开关控制,默认关 → 行为不变):`Observation` 加
+`gripper_pc` 字段、`pi0.py` 加 `PointNetEncoder`、prefix 拼接、`AirbotEEFInputs` 注入描述符。
+配置 `pi05_teleop_eef_grip` 用于纯平行爪的**回归 A/B**(开/关 token 在金标准遥操作数据上应持平,
+再混入其它夹爪)。
+
+> 描述符 `.npy` 已 gitignore(可由 CAD 重生成);训练 `gripper_token` 配置前需把它拷到服务器。
+
+---
+
+## 9. 测试后清理
 ```bash
 conda env remove -n openpi_airbot
 rm -rf .venv
