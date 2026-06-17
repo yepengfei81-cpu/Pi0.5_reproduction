@@ -172,3 +172,7 @@ umi/output/
 
 # airbot_play logs
 airbot_logs/
+
+# 夹爪几何描述符的生成物(点云 npy / 可视化图)：由 CAD + 脚本生成, 不入库, 只留脚本
+gripper_geom/*.npy
+gripper_geom/*.png
