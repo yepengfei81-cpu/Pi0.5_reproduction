@@ -50,8 +50,9 @@ class CheckpointWeightLoader(WeightLoader):
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        # Add all missing LoRA weights, and the gripper_encoder(方案C 新增模块, 不在预训练
+        # checkpoint 里, 和 LoRA 一样从模型随机初始化保留)。
+        return _merge_params(loaded_params, params, missing_regex=".*(lora|gripper_encoder).*")
 
 
 @dataclasses.dataclass(frozen=True)
