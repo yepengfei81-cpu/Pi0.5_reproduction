@@ -183,10 +183,16 @@ def train_step(
             lambda _, x: x.value.ndim > 1,
         ),
     )
+    # 方案C: 单独监控 gripper_encoder(PointNet) 的梯度/权重范数, 确认它在学
+    # (gripper_grad_norm 持续 >0 且 param_norm 变化 = 模块在被训练, 非死/非冻结)。
+    # 无 gripper_token 的配置下这两个过滤为空 -> 范数=0, 不影响。
+    gripper_filter = nnx_utils.PathRegex(".*gripper_encoder.*")
     info = {
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        "gripper_grad_norm": optax.global_norm(grads.filter(gripper_filter)),
+        "gripper_param_norm": optax.global_norm(nnx.state(model, nnx.All(nnx.Param, gripper_filter))),
     }
     return new_state, info
 

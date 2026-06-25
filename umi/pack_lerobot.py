@@ -44,6 +44,9 @@ from umi_to_lerobot import (  # noqa: E402
 )
 from replay_check import rpy_to_rot  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gripper_geom"))
+from gripper_params import get_params  # noqa: E402  每爪开合范围 + 指尖偏移
+
 import tempfile
 
 DEFAULT_ALIGN_RPY = (-1.0, -16.8, 0.0)   # UMI body -> AIRBOT 工具系 (calib_align 标定)
@@ -81,8 +84,9 @@ def make_state_action(pos, rot6d, grip01):
 # ---------------------------------------------------------------------------
 # UMI：mcap -> 帧序列
 # ---------------------------------------------------------------------------
-def read_wrist_frames(mcap_path, cam_name, target_hfov):
-    """读 UMI 主相机：去畸变(79°)后的帧 + 每帧时间戳。返回 (frames[HxWx3 RGB], ts(ns))。"""
+def read_wrist_frames(mcap_path, cam_name, target_hfov, undistort=True):
+    """读 UMI 主相机帧 + 每帧时间戳。返回 (frames[HxWx3 RGB 640x480], ts(ns))。
+    undistort=True: 去畸变(target_hfov, 对齐 D405); False: 原生鱼眼直接 resize(保留全广角)。"""
     cams = read_mcap_cameras(mcap_path)
     cam = next((c for c in cams.values() if c["name"] == cam_name), None)
     if cam is None or cam["calib"] is None or not cam["h264"]:
@@ -98,25 +102,28 @@ def read_wrist_frames(mcap_path, cam_name, target_hfov):
             return None, None
         first = cv2.imread(str(jpgs[0]))
         native = (first.shape[1], first.shape[0])
-        m1, m2, _K, (w, h) = build_undistort_maps(
-            cam["calib"], 0.0, 1.0, target_hfov, src_size=native,
-            out_size=(OUT_W, OUT_H))
+        m1 = m2 = None
+        if undistort:
+            m1, m2, _K, _wh = build_undistort_maps(
+                cam["calib"], 0.0, 1.0, target_hfov, src_size=native,
+                out_size=(OUT_W, OUT_H))
         frames = []
         for jpg in jpgs:
             img = cv2.imread(str(jpg))
             if (img.shape[1], img.shape[0]) != native:
                 img = cv2.resize(img, native)
-            und = cv2.remap(img, m1, m2, interpolation=cv2.INTER_LINEAR,
-                            borderMode=cv2.BORDER_CONSTANT)
-            frames.append(und[:, :, ::-1].copy())   # BGR->RGB
+            out = (cv2.remap(img, m1, m2, interpolation=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT)
+                   if undistort else cv2.resize(img, (OUT_W, OUT_H)))
+            frames.append(out[:, :, ::-1].copy())   # BGR->RGB
     n = min(len(frames), len(ts))
     return frames[:n], ts[:n]
 
 
 def process_umi_episode(mcap_path, tcp_offset, R_align, robot_gripper_max,
-                        target_hfov):
+                        target_hfov, undistort=True):
     """UMI mcap -> {wrist, env, state, actions, env_mask}（10Hz, W' 系）。"""
-    wrist_frames, cam_ts = read_wrist_frames(mcap_path, UMI_MAIN_CAM, target_hfov)
+    wrist_frames, cam_ts = read_wrist_frames(mcap_path, UMI_MAIN_CAM, target_hfov, undistort)
     if wrist_frames is None:
         print(f"  ✗ {mcap_path.name}: 无主相机帧, 跳过")
         return None
@@ -176,8 +183,9 @@ def read_video_frames(mp4_path):
     return frames
 
 
-def process_teleop_episode(parquet, img_mp4, wrist_mp4, robot_gripper_max):
-    """遥操作 episode -> {wrist, env, state, actions, env_mask}（W' 系）。"""
+def process_teleop_episode(parquet, img_mp4, wrist_mp4, gclose, gopen, tcp_offset):
+    """遥操作 episode -> {wrist, env, state, actions, env_mask}（W' 系）。
+    夹爪按该爪 [gclose, gopen] 归一化; tcp_offset 把位姿锚到指尖(parallel=0 即原状)。"""
     import pyarrow.parquet as pq
     t = pq.read_table(parquet).to_pydict()
     if "state_eef" not in t:
@@ -189,15 +197,18 @@ def process_teleop_episode(parquet, img_mp4, wrist_mp4, robot_gripper_max):
     quat = se[:, 3:7]
     grip_follow = se[:, 7]
     R_tool = np.stack([quat_to_rot(*q) for q in quat])    # 已是工具系(base)
+    off = np.asarray(tcp_offset, float)
+    pos_tip = pos_base + np.einsum("nij,j->ni", R_tool, off)   # EE点 -> 指尖(off=0 即不变)
+    span = (gopen - gclose) or 1.0
 
-    pos, rot6d = build_wprime(pos_base, R_tool)
-    grip_state = np.clip(grip_follow / robot_gripper_max, 0.0, 1.0).astype(np.float32)
+    pos, rot6d = build_wprime(pos_tip, R_tool)
+    grip_state = np.clip((grip_follow - gclose) / span, 0.0, 1.0).astype(np.float32)
     state, action = make_state_action(pos, rot6d, grip_state)
     # 关键修正: 动作夹爪改用 lead(遥操作指令)夹爪。follow(实际)抓取时只能闭到积木宽度、
     # 表达不出"夹紧力", 模型学了就会"贴着积木宽度但不夹住"。lead 抓取时→~0, 才会真夹紧。
     if "actions_eef" in t:
         ae = np.array(t["actions_eef"], dtype=np.float64)   # (N,8) lead pose + lead(指令)grip
-        grip_lead = np.clip(ae[:, 7] / robot_gripper_max, 0.0, 1.0).astype(np.float32)
+        grip_lead = np.clip((ae[:, 7] - gclose) / span, 0.0, 1.0).astype(np.float32)
         m = min(len(action), len(grip_lead))
         action[:m, 9] = grip_lead[:m]                       # 只换动作的夹爪维, 位姿仍用 next-state(已验证)
     else:
@@ -237,6 +248,9 @@ def create_dataset(out_dir, repo_id):
             "state":   {"dtype": "float32", "shape": (10,), "names": ["state"]},
             "actions": {"dtype": "float32", "shape": (10,), "names": ["actions"]},
             "env_mask": {"dtype": "float32", "shape": (1,), "names": ["env_mask"]},
+            # 方案C: 该帧用哪把爪(0=parallel, 1=get, ...)。顺序须与 grippers.npz 的
+            # names 及训练 config 的 gripper_names 一致。训练时按它查表选夹爪点云。
+            "gripper_id": {"dtype": "int64", "shape": (1,), "names": ["gripper_id"]},
         },
         image_writer_threads=4, image_writer_processes=2,
     )
@@ -266,7 +280,7 @@ def make_server_compatible(out_dir):
         print(f"  ✓ 兼容处理: {n} 个 parquet 特征类型 List->Sequence (服务器 datasets 3.x 可读)")
 
 
-def write_episode(dataset, ep, task):
+def write_episode(dataset, ep, task, gripper_id=0):
     for i in range(len(ep["state"])):
         dataset.add_frame({
             "image": ep["env"][i],
@@ -274,6 +288,7 @@ def write_episode(dataset, ep, task):
             "state": ep["state"][i],
             "actions": ep["actions"][i],
             "env_mask": np.array([ep["env_mask"][i]], np.float32),
+            "gripper_id": np.array([gripper_id], np.int64),
             "task": task,
         })
     dataset.save_episode()
@@ -281,23 +296,63 @@ def write_episode(dataset, ep, task):
 
 def main():
     ap = argparse.ArgumentParser(description="阶段4: UMI + 遥操作 -> 统一联合训练 LeRobot")
-    ap.add_argument("--umi-dir", default=None, help="UMI VIO mcap 目录（--skip-umi 时可省）")
+    ap.add_argument("--umi-dir", nargs="+", default=None,
+                    help="UMI VIO mcap 目录(可多个; 建议一个任务一个目录)。--skip-umi 时可省")
     ap.add_argument("--teleop-dir", required=True, nargs="+",
                     help="遥操作 LeRobot 数据集根目录(可传多个, 如积木目录 擦黑板目录)")
     ap.add_argument("--skip-umi", action="store_true",
                     help="只打包遥操作（测试③：纯遥操作 EEF，头部相机全程有效）")
     ap.add_argument("-o", "--output", required=True, help="输出合并数据集目录")
     ap.add_argument("--repo-id", default="cotrain_eef")
-    ap.add_argument("--umi-task", default="wipe the blackboard")
+    ap.add_argument("--umi-task", nargs="+", default=["wipe the blackboard"],
+                    help="每个 --umi-dir 的 prompt: 给1个=全部广播, 或与 --umi-dir 数等长(多任务)")
+    # 方案C: 夹爪与"采集方式无关", 按来源显式指定爪名。名字须在 --gripper-names 里,
+    # 其下标即存进数据的 gripper_id(须与 grippers.npz names / config gripper_names 一致)。
+    #   --gripper-names   定义爪名->id 的顺序 (默认 parallel get)
+    #   --umi-gripper     UMI 这批用哪把爪 (默认 get; 未来 UMI 换爪改这里)
+    #   --teleop-gripper  每个 --teleop-dir 用哪把爪: 给1个=全部广播, 或与目录数等长
+    #                     (默认 parallel; 未来在臂上装 GET 遥操作就传 get)
+    ap.add_argument("--gripper-names", nargs="+", default=["parallel", "get"])
+    ap.add_argument("--umi-gripper", nargs="+", default=["get"],
+                    help="每个 --umi-dir 的爪: 给1个=广播, 或与 --umi-dir 数等长")
+    ap.add_argument("--teleop-gripper", nargs="+", default=["parallel"])
     ap.add_argument("--teleop-task", default=None,
                     help="覆盖所有 teleop 的 prompt; 默认 None=从各源 tasks.jsonl 按 task_index 自动读")
     ap.add_argument("--tcp-offset", nargs=3, type=float, default=list(DEFAULT_TCP_OFFSET))
     ap.add_argument("--align-rpy", nargs=3, type=float, default=list(DEFAULT_ALIGN_RPY))
     ap.add_argument("--robot-gripper-max", type=float, default=DEFAULT_ROBOT_GRIPPER_MAX)
     ap.add_argument("--target-hfov", type=float, default=TARGET_HFOV)
+    ap.add_argument("--no-undistort", action="store_true",
+                    help="UMI 不去畸变: 用原生鱼眼 resize 到 640x480(保留全广角), "
+                         "先用鱼眼原生画面训练时开此项")
     ap.add_argument("--limit", type=int, default=None, help="每来源最多处理几条(调试)")
     ap.add_argument("--verify", action="store_true", help="打包后重载抽检")
     args = ap.parse_args()
+
+    # 夹爪名 -> id (下标), 与 grippers.npz / config.gripper_names 一致
+    name_to_id = {n: i for i, n in enumerate(args.gripper_names)}
+
+    def gid_of(name):
+        if name not in name_to_id:
+            sys.exit(f"未知夹爪 '{name}', 须在 --gripper-names {args.gripper_names} 中")
+        return name_to_id[name]
+
+    def broadcast(lst, n, what):
+        if len(lst) == 1:
+            return lst * n
+        if len(lst) != n:
+            sys.exit(f"{what} 须为1个(广播)或与目录数({n})等长, 当前 {len(lst)} 个")
+        return lst
+
+    # 遥操作: 每目录的爪(prompt 由各目录 tasks.jsonl 自带)
+    teleop_gids = [gid_of(n) for n in broadcast(args.teleop_gripper, len(args.teleop_dir), "--teleop-gripper")]
+    # UMI: 每目录的 prompt + 爪(mcap 无 prompt, 在此按目录指定; 多任务=多目录)
+    umi_dirs = [] if (args.skip_umi or not args.umi_dir) else list(args.umi_dir)
+    umi_tasks = broadcast(args.umi_task, len(umi_dirs), "--umi-task") if umi_dirs else []
+    umi_gids = [gid_of(n) for n in broadcast(args.umi_gripper, len(umi_dirs), "--umi-gripper")] if umi_dirs else []
+    print(f"夹爪映射: names={args.gripper_names}")
+    print(f"  UMI    -> {list(zip(umi_dirs, [args.gripper_names[g] for g in umi_gids], umi_tasks))}")
+    print(f"  teleop -> {list(zip(args.teleop_dir, [args.gripper_names[g] for g in teleop_gids]))}")
 
     R_align = rpy_to_rot(*args.align_rpy)
     out_dir = Path(args.output).expanduser().resolve()
@@ -305,28 +360,31 @@ def main():
 
     stats = {"umi": [0, 0], "teleop": [0, 0]}   # [episodes, frames]
 
-    # ---- UMI ----
-    if args.skip_umi or not args.umi_dir:
-        umi_mcaps = []
+    # ---- UMI (每目录: 自己的 prompt + 爪; 多任务=多目录) ----
+    if not umi_dirs:
         print("\n=== UMI: 跳过 (--skip-umi) ===")
-    else:
-        umi_mcaps = sorted(Path(args.umi_dir).expanduser().glob("*.mcap"))
+    print(f"\n=== UMI: {len(umi_dirs)} 个目录 ===") if umi_dirs else None
+    for udir, utask, ugid in zip(umi_dirs, umi_tasks, umi_gids):
+        mcaps = sorted(Path(udir).expanduser().glob("*.mcap"))
         if args.limit:
-            umi_mcaps = umi_mcaps[:args.limit]
-        print(f"\n=== UMI: {len(umi_mcaps)} 条 ===")
-    for m in umi_mcaps:
-        ep = process_umi_episode(m, args.tcp_offset, R_align,
-                                 args.robot_gripper_max, args.target_hfov)
-        if ep is None:
-            continue
-        write_episode(dataset, ep, args.umi_task)
-        stats["umi"][0] += 1; stats["umi"][1] += len(ep["state"])
-        print(f"  ✓ {m.name}: {len(ep['state'])} 帧")
+            mcaps = mcaps[:args.limit]
+        print(f"  [{Path(udir).name}] {len(mcaps)} 条  task='{utask}'  爪={args.gripper_names[ugid]}")
+        for m in mcaps:
+            ep = process_umi_episode(m, args.tcp_offset, R_align,
+                                     args.robot_gripper_max, args.target_hfov,
+                                     undistort=not args.no_undistort)
+            if ep is None:
+                continue
+            write_episode(dataset, ep, utask, gripper_id=ugid)
+            stats["umi"][0] += 1; stats["umi"][1] += len(ep["state"])
+            print(f"    ✓ {m.name}: {len(ep['state'])} 帧")
 
     # ---- 遥操作(可多个目录; prompt 默认从各源 tasks.jsonl 按 task_index 自动读) ----
     troots = [Path(d).expanduser() for d in args.teleop_dir]
     print(f"\n=== 遥操作: {len(troots)} 个目录 ===")
-    for troot in troots:
+    for ti_dir, troot in enumerate(troots):
+        teleop_gid = teleop_gids[ti_dir]
+        tgp = get_params(args.gripper_names[teleop_gid])   # 该目录爪的开合范围+指尖偏移
         src_tasks = load_source_tasks(troot)
         pqs = sorted((troot / "data").rglob("episode_*.parquet"))
         if args.limit:
@@ -338,7 +396,8 @@ def main():
             wrist_mp4 = troot / "videos" / pqf.parent.name / "wrist_image" / f"{stem}.mp4"
             if not img_mp4.exists() or not wrist_mp4.exists():
                 print(f"    ✗ {stem}: 缺视频, 跳过"); continue
-            ep = process_teleop_episode(pqf, img_mp4, wrist_mp4, args.robot_gripper_max)
+            ep = process_teleop_episode(pqf, img_mp4, wrist_mp4,
+                                        tgp["close"], tgp["open"], tgp["tcp_offset"])
             if ep is None:
                 continue
             # prompt: --teleop-task 覆盖优先, 否则按本条 task_index 从源 tasks.jsonl 读
@@ -348,7 +407,7 @@ def main():
                 task = src_tasks.get(ti) if ti is not None else None
                 if task is None:
                     print(f"    ✗ {stem}: 源无 task(index={ti}), 跳过"); continue
-            write_episode(dataset, ep, task)
+            write_episode(dataset, ep, task, gripper_id=teleop_gid)
             stats["teleop"][0] += 1; stats["teleop"][1] += len(ep["state"])
             print(f"    ✓ {stem}: {len(ep['state'])} 帧  task='{task}'")
 

@@ -39,8 +39,11 @@ class AirbotEEFInputs(transforms.DataTransformFn):
     """EEF 任务空间输入: 10D state + 双相机(env 槽按 env_mask 决定是否有效)。"""
     model_type: _model.ModelType = _model.ModelType.PI0
     # 方案C: 夹爪几何点云 (P,3) (TCP 系)。None=不用 gripper token。
-    # 当前单把爪: 所有样本注入同一份描述符; 将来多把爪改为按 observation/gripper_id 查表。
+    # 单把爪: 所有样本注入同一份 gripper_pc(常量)。
     gripper_pc: np.ndarray | None = None
+    # 多把爪共训: gripper_clouds (G,P,3) 查表, 按每帧 observation/gripper_id 选第几把爪。
+    # 与 gripper_pc 互斥(给了 gripper_clouds 就用它)。部署单爪时 gripper_id 缺省=0。
+    gripper_clouds: np.ndarray | None = None
 
     def __call__(self, data: dict) -> dict:
         base_image = _parse_image(data["observation/image"])
@@ -65,7 +68,14 @@ class AirbotEEFInputs(transforms.DataTransformFn):
             },
         }
 
-        if self.gripper_pc is not None:
+        # 部署/zero-shot: obs 直接带 gripper_pc(当前夹爪甚至未见爪的描述符), 优先用
+        if data.get("observation/gripper_pc") is not None:
+            inputs["gripper_pc"] = np.asarray(data["observation/gripper_pc"], np.float32)
+        elif self.gripper_clouds is not None:
+            gid = int(np.asarray(data.get("observation/gripper_id", 0)).reshape(-1)[0])
+            gid = min(max(gid, 0), len(self.gripper_clouds) - 1)
+            inputs["gripper_pc"] = np.asarray(self.gripper_clouds[gid], np.float32)
+        elif self.gripper_pc is not None:
             inputs["gripper_pc"] = np.asarray(self.gripper_pc, np.float32)
 
         if "actions" in data:

@@ -89,7 +89,15 @@ def main():
         parts = [(name, p @ Rextra.T) for name, p in parts]
 
     pts = np.vstack([p for _, p in parts])
-    region = np.concatenate([np.full(len(p), i) for i, (_, p) in enumerate(parts)]).astype(int)
+    # 统一语义(与 build_gripper_descriptor 一致):
+    #   finger_id: 0=left, 1=right (link6 等其它件 = -1)
+    #   region: 沿接近轴 +X 切, 0=指尖区(近 +X 端), 1=后部(rear)
+    fid_map = {"left": 0, "right": 1}
+    finger_id = np.concatenate(
+        [np.full(len(p), fid_map.get(name, -1)) for name, p in parts]).astype(np.int8)
+    x = pts[:, 0]
+    span = float(x.max() - x.min())
+    region = (x < x.max() - 0.33 * span).astype(np.int8)
     names = [name for name, _ in parts]
 
     # 功能区锚点: 每个指的"指尖"= 离整体质心最远的点(snap 在表面上, 因为就是采样点本身)
@@ -101,8 +109,8 @@ def main():
             anchors[f"fingertip_{name}"] = tip.tolist()
 
     np.save(args.out, {"points": pts.astype(np.float32), "region": region,
-                       "part_names": names, "anchors": anchors, "frame": args.frame,
-                       "opening": q}, allow_pickle=True)
+                       "finger_id": finger_id, "part_names": names, "anchors": anchors,
+                       "frame": args.frame, "opening": q}, allow_pickle=True)
     print(f">>> 已存描述符: {args.out}")
     print(f"    点云 {pts.shape}  parts={names}  frame={args.frame}  opening={q}")
     print(f"    包围盒(m) min={pts.min(0).round(3).tolist()} max={pts.max(0).round(3).tolist()}")

@@ -25,11 +25,15 @@ openpi 数据收集脚本：遥操作 + 双相机录制 → LeRobot 格式
 import argparse
 import logging
 import shutil
+import sys
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gripper_geom"))
+from gripper_params import get_params  # noqa: E402  每爪开合范围
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -47,14 +51,18 @@ HOME_JOINT = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # 零位关节角
 # 不一致(lead 更小)——本应一样,属于设计 bug。这里按一次性标定的全开值线性映射
 # lead->follow 修正它,让 follow 能张到自己的最大(否则夹不起板擦等宽物)。固定即可,无需每次标定。
 LEAD_GRIPPER_MAX = 0.049     # lead(Replay) 完全张开时 get_eef_pos()[0] (标定固定值)
-FOLLOW_GRIPPER_MAX = 0.073   # follow(Play) 完全张开值
+# follow(Play)上装的爪的 [刚好闭合, 完全张开] 电机读数。main 里按 --follow-gripper
+# 从 gripper_params.py 覆盖。平行爪=[0, 0.073]; GET 用 [c_get, o_get](避免过挤压)。
+FOLLOW_GRIPPER_MIN = 0.0
+FOLLOW_GRIPPER_MAX = 0.073
 
 
 def lead_grip_to_follow(lead_g):
-    """把 lead 夹爪值线性映射到 follow 量程(两端对齐: 全闭→0, 全开→FOLLOW_GRIPPER_MAX)。
-    映射后的值同时用于(a)下发给 follow, (b)存进 action/action_eef —— 保证训练里
-    夹爪单位 = follow 物理单位, 与 state(follow) 一致, 打包 ÷0.073 归一化才正确。"""
-    return float(np.clip(lead_g * FOLLOW_GRIPPER_MAX / LEAD_GRIPPER_MAX, 0.0, FOLLOW_GRIPPER_MAX))
+    """lead 夹爪值 -> follow 当前爪的 [MIN, MAX] 量程(全闭→MIN, 全开→MAX)。
+    映射值同时(a)下发给 follow,(b)存进 action —— 与 state(follow) 同单位;
+    打包时按每爪 [close, open] 归一化。GET 的 MIN=c_get>0, 防止滑轨压到 0 把 GET 过挤压。"""
+    frac = float(np.clip(lead_g / LEAD_GRIPPER_MAX, 0.0, 1.0))
+    return float(FOLLOW_GRIPPER_MIN + frac * (FOLLOW_GRIPPER_MAX - FOLLOW_GRIPPER_MIN))
 
 
 def parse_args():
@@ -69,6 +77,8 @@ def parse_args():
                         help="输出目录 (默认 HF_LEROBOT_HOME)")
     parser.add_argument("--no-display", action="store_true",
                         help="禁用相机可视化窗口")
+    parser.add_argument("--follow-gripper", type=str, default="parallel",
+                        help="follow 臂上装的爪名(读 gripper_params.py 的开合范围); 默认 parallel")
     return parser.parse_args()
 
 
@@ -389,6 +399,13 @@ def write_episode(dataset, frames, task):
 
 def main():
     args = parse_args()
+
+    # follow 臂当前爪的开合范围(覆盖默认平行爪), 防止对 GET 过挤压
+    global FOLLOW_GRIPPER_MIN, FOLLOW_GRIPPER_MAX
+    _gp = get_params(args.follow_gripper)
+    FOLLOW_GRIPPER_MIN, FOLLOW_GRIPPER_MAX = float(_gp["close"]), float(_gp["open"])
+    logger.info(f"follow 爪='{args.follow_gripper}' 开合范围 "
+                f"[{FOLLOW_GRIPPER_MIN:.4f}, {FOLLOW_GRIPPER_MAX:.4f}]")
 
     from airbot_py.arm import AIRBOTArm, RobotMode, SpeedProfile
 

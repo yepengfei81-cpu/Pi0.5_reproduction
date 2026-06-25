@@ -21,7 +21,7 @@ UMI mcap -> openpi/LeRobot 训练数据转换。
          内置自检：6D 旋转往返误差、首帧位置/yaw 归零、重力方向语义。
   [✓] 3. 夹爪（--poses 时一并输出 gripper_norm）：磁编码器读数(米, 0=闭合)
          -> clip(value / 0.073, 0, 1)。共享参考 = AIRBOT 全开 73mm；
-         UMI 全开 82mm 张到 >73mm 的部分 clip 到 1.0（同物理开口同归一值）。
+         UMI 全开 5mm 张到 >73mm 的部分 clip 到 1.0（同物理开口同归一值）。
   [ ] 4. 打包 LeRobot 数据集（base_0_rgb 置零 + image_mask=False，
          wrist 槽放去畸变后的主相机画面）。
 
@@ -207,10 +207,10 @@ POSE_TOPIC = "/robot0/vio/eef_pose"
 GRIPPER_TOPIC = "/robot0/sensor/magnetic_encoder"
 
 # 夹爪归一化共享参考：两边 0 都=闭合；用 AIRBOT 全开(实测 73mm)做分母，
-# UMI(实测全开 82mm)张到 >73mm 的部分 clip 到 1.0。这样同一物理开口在
+# UMI(实测全开 85mm)张到 >73mm 的部分 clip 到 1.0。这样同一物理开口在
 # UMI/遥操作两边映射到同一个 [0,1] 值（物理一致，而非各自 min-max）。
 DEFAULT_ROBOT_GRIPPER_MAX = 0.073   # AIRBOT 指尖全开间距 (m)
-UMI_GRIPPER_MAX = 0.082             # UMI 全开 (m)，仅用于报告/校验
+UMI_GRIPPER_MAX = 0.085             # UMI 全开 (m)，仅用于报告/校验
 
 
 def quat_to_rot(x, y, z, w) -> np.ndarray:
@@ -393,7 +393,7 @@ def process_poses(mcap_path: Path, out_dir: Path, tcp_offset,
 
 def process_mcap(mcap_path: Path, out_dir: Path, fps: int, balance: float,
                  fov_scale: float, side_by_side: bool, only: set[str] | None,
-                 target_hfov: float | None = None):
+                 target_hfov: float | None = None, undistort: bool = True):
     print(f"\n=== {mcap_path.name} ===")
     cams = read_mcap_cameras(mcap_path)
     if not cams:
@@ -430,14 +430,19 @@ def process_mcap(mcap_path: Path, out_dir: Path, fps: int, balance: float,
             # 用原生分辨率帧做 remap 源，输出 640x480：清晰度远好于先缩小再去畸变
             first = cv2.imread(str(frames[0]))
             native = (first.shape[1], first.shape[0])
-            m1, m2, Knew, (w, h) = build_undistort_maps(cal, balance, fov_scale,
-                                                        target_hfov, src_size=native)
-            hfov = 2 * math.degrees(math.atan(w / (2 * Knew[0, 0])))
-            vfov = 2 * math.degrees(math.atan(h / (2 * Knew[1, 1])))
-            print(f"    源 {native[0]}x{native[1]} -> 输出 {w}x{h}  "
-                  f"视场: HFOV={hfov:.1f}°  VFOV={vfov:.1f}°")
+            if undistort:
+                m1, m2, Knew, (w, h) = build_undistort_maps(cal, balance, fov_scale,
+                                                            target_hfov, src_size=native)
+                hfov = 2 * math.degrees(math.atan(w / (2 * Knew[0, 0])))
+                vfov = 2 * math.degrees(math.atan(h / (2 * Knew[1, 1])))
+                print(f"    源 {native[0]}x{native[1]} -> 去畸变 {w}x{h}  "
+                      f"视场: HFOV={hfov:.1f}°  VFOV={vfov:.1f}°")
+            else:   # 不去畸变: 原生鱼眼直接 resize 到 640x480, 保留全广角
+                w, h = 640, 480
+                print(f"    源 {native[0]}x{native[1]} -> 原生鱼眼(不去畸变) resize {w}x{h} (保留广角)")
+            tag = "undist" if undistort else "fisheye"
             out_w = w * 2 if side_by_side else w
-            out_mp4 = out_dir / f"{stem}_{name}_undist.mp4"
+            out_mp4 = out_dir / f"{stem}_{name}_{tag}.mp4"
             vw = cv2.VideoWriter(str(out_mp4), fourcc, fps, (out_w, h))
             if not vw.isOpened():
                 print(f"  ✗ 无法创建输出文件: {out_mp4}\n"
@@ -447,12 +452,13 @@ def process_mcap(mcap_path: Path, out_dir: Path, fps: int, balance: float,
                 img = cv2.imread(str(jpg))
                 if (img.shape[1], img.shape[0]) != native:
                     img = cv2.resize(img, native)
-                und = cv2.remap(img, m1, m2, interpolation=cv2.INTER_LINEAR,
-                                borderMode=cv2.BORDER_CONSTANT)
+                out_img = (cv2.remap(img, m1, m2, interpolation=cv2.INTER_LINEAR,
+                                     borderMode=cv2.BORDER_CONSTANT)
+                           if undistort else cv2.resize(img, (w, h)))
                 if side_by_side:
-                    vw.write(np.hstack([cv2.resize(img, (w, h)), und]))
+                    vw.write(np.hstack([cv2.resize(img, (w, h)), out_img]))
                 else:
-                    vw.write(und)
+                    vw.write(out_img)
             vw.release()
             print(f"  ✓ {out_mp4}  ({len(frames)} 帧)")
 
@@ -472,6 +478,9 @@ def main():
                     help="输出视场缩放, >1 看到更广但更小 (默认 1.0)")
     ap.add_argument("--side-by-side", action="store_true",
                     help="输出 原图|去畸变 左右对比, 便于肉眼确认")
+    ap.add_argument("--no-undistort", action="store_true",
+                    help="不去畸变: 直接用原生鱼眼 resize 到 640x480(保留全广角)。"
+                         "打包训练时也要在 pack_lerobot.py 加同名开关才生效于训练数据")
     ap.add_argument("--cameras", nargs="*", default=["camera0"],
                     help="要处理的相机 (默认只有主相机 camera0，即中间那路)；传 all 处理全部三路")
     ap.add_argument("--poses", action="store_true",
@@ -510,7 +519,8 @@ def main():
                           args.robot_gripper_max)
         else:
             process_mcap(m, out_dir, args.fps, args.balance, args.fov_scale,
-                         args.side_by_side, only, args.target_hfov)
+                         args.side_by_side, only, args.target_hfov,
+                         undistort=not args.no_undistort)
 
 
 if __name__ == "__main__":

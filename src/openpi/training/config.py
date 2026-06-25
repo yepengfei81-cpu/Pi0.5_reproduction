@@ -405,41 +405,54 @@ class LeRobotAirbotPlayDataConfig(DataConfigFactory):
 class LeRobotAirbotEEFDataConfig(DataConfigFactory):
     """Data config for UMI + 遥操作 联合训练 (任务空间 EEF 10D, 由 umi/pack_lerobot.py 产出)。"""
 
-    # 方案C: 夹爪几何描述符 .npy 路径(gripper_geom/build_*.py 产出)。给了就注入 gripper_pc。
-    # 当前单把爪; 多把爪以后改成按来源映射。文件被 gitignore, 服务器上需自行放好。
+    # 方案C: 夹爪几何描述符。两种方式(文件均被 gitignore, 服务器上需自行放好):
+    #   单把爪: gripper_pc_path 指向单个 .npy(常量描述符, 所有样本同一份)。
+    #   多把爪共训: grippers_npz_path 指向 grippers.npz(含多把爪点云), 训练时按每帧
+    #              gripper_id 查表选; gripper_names 定义 id 顺序(须与打包时一致)。
     gripper_pc_path: str | None = None
+    grippers_npz_path: str | None = None
+    gripper_names: tuple[str, ...] = ("parallel", "get")
     num_gripper_points: int = 512
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         # LeRobot 存储的 key -> 模型期望的 key (加 observation/ 前缀)；多带 env_mask
+        repack_map = {
+            "observation/image": "image",
+            "observation/wrist_image": "wrist_image",
+            "observation/state": "state",
+            "observation/env_mask": "env_mask",
+            "actions": "actions",
+            "prompt": "prompt",
+        }
+        if self.grippers_npz_path is not None:
+            repack_map["observation/gripper_id"] = "gripper_id"   # 多爪: 每帧选第几把爪
         repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/image": "image",
-                        "observation/wrist_image": "wrist_image",
-                        "observation/state": "state",
-                        "observation/env_mask": "env_mask",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
+            inputs=[_transforms.RepackTransform(repack_map)]
         )
 
-        # 方案C: 加载夹爪几何描述符(若提供), 采样到固定 P 点, 注入每个样本
-        gripper_pc = None
-        if self.gripper_pc_path is not None:
-            d = np.load(self.gripper_pc_path, allow_pickle=True).item()
-            pc = np.asarray(d["points"], np.float32)
+        def _subsample(pc: np.ndarray) -> np.ndarray:
+            pc = np.asarray(pc, np.float32)
             idx = np.random.default_rng(0).choice(
                 len(pc), self.num_gripper_points, replace=len(pc) < self.num_gripper_points)
-            gripper_pc = pc[idx]
+            return pc[idx]
+
+        # 方案C: 夹爪几何描述符。多爪(grippers.npz) 优先于单爪(单 .npy)。
+        gripper_pc = None
+        gripper_clouds = None
+        if self.grippers_npz_path is not None:
+            z = np.load(self.grippers_npz_path, allow_pickle=True)
+            # 按 gripper_names 顺序堆成 (G, P, 3); 顺序须与打包时的 gripper_id 一致
+            gripper_clouds = np.stack(
+                [_subsample(z[f"{name}_points"]) for name in self.gripper_names])
+        elif self.gripper_pc_path is not None:
+            d = np.load(self.gripper_pc_path, allow_pickle=True).item()
+            gripper_pc = _subsample(d["points"])
 
         data_transforms = _transforms.Group(
             inputs=[airbot_eef_policy.AirbotEEFInputs(
-                model_type=model_config.model_type, gripper_pc=gripper_pc)],
+                model_type=model_config.model_type,
+                gripper_pc=gripper_pc, gripper_clouds=gripper_clouds)],
             outputs=[airbot_eef_policy.AirbotEEFOutputs()],
         )
         # 注意: EEF 用 W' 相对系(已去掉全局偏移), 且 rot6d 不适合做差分, 故不加
@@ -1125,6 +1138,39 @@ _CONFIGS = [
         data=LeRobotAirbotEEFDataConfig(
             repo_id="teleop_eef",
             gripper_pc_path="gripper_geom/parallel.npy",
+            num_gripper_points=512,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    #
+    # 方案C 多爪共训: parallel(遥操作) + GET(UMI) 混训, 每帧按 gripper_id 查 grippers.npz
+    # 选夹爪点云。token 的有效性在这里才可测(token on/off、错 token、留出爪)。
+    # 数据需用 pack_lerobot.py 打好 gripper_id(遥操作=0, UMI=1); grippers.npz 被
+    # gitignore, 服务器上要自行放到该路径。对照(token off)= 同数据的 pi05_cotrain_eef。
+    #
+    TrainConfig(
+        name="pi05_cotrain_eef_grip",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            gripper_token=True,
+            num_gripper_points=512,
+        ),
+        data=LeRobotAirbotEEFDataConfig(
+            repo_id="cotrain_eef",
+            grippers_npz_path="gripper_geom/grippers.npz",
+            gripper_names=("parallel", "get"),
             num_gripper_points=512,
             base_config=DataConfig(prompt_from_task=True),
         ),
