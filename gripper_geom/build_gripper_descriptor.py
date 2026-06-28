@@ -61,6 +61,18 @@ def load_points(path, n, units):
     return pts
 
 
+def load_aligned_mesh(path, units, M):
+    """加载原始 mesh -> 缩放到米 -> 应用同一坐标重映射 M, 得到与点云同一公共系的 mesh。"""
+    m = trimesh.load(str(path), force="mesh")
+    if units == "auto":
+        units = "mm" if (m.bounds[1] - m.bounds[0]).max() > 1.0 else "m"
+    if units == "mm":
+        m.apply_scale(0.001)
+    T = np.eye(4); T[:3, :3] = np.asarray(M, float)
+    m.apply_transform(T)
+    return m
+
+
 def assemble_get(left_pts, right_pts, opening, flip):
     """两指局部系 -> 装配系(接近=+Y, 开合=±Z, 横向=X, TCP=原点)。
 
@@ -94,10 +106,15 @@ def to_common(pts):
     return pts @ P.T
 
 
-def region_by_x(x, tip_frac):
-    """按接近轴 X 切功能区: 指尖在 +X 端(max X)。0=指尖区, 1=后部(rear)。"""
-    span = float(x.max() - x.min())
-    return (x < x.max() - tip_frac * span).astype(np.int8)
+def region_by_x(x, tip_frac=0.33, rear_frac=0.33):
+    """按接近轴 X 切 3 个功能区(指尖在 +X 端): 0=指尖, 1=中部, 2=后部(近 -X 端)。"""
+    x = np.asarray(x, float)
+    lo, hi = x.min(), x.max()
+    span = float(hi - lo) or 1.0
+    reg = np.ones(len(x), np.int8)              # 1 = 中部 middle
+    reg[x >= hi - tip_frac * span] = 0          # 0 = 指尖 tip(近 +X)
+    reg[x <= lo + rear_frac * span] = 2         # 2 = 后部 rear(近 -X)
+    return reg
 
 
 def _axis_vec(s):
@@ -138,7 +155,9 @@ def main():
     ap.add_argument("--units", choices=["auto", "mm", "m"], default="auto")
     ap.add_argument("--n", type=int, default=2500, help="每个 finger 采样点数")
     ap.add_argument("--tip-frac", type=float, default=0.33,
-                    help="近 TCP(接近方向)前这一比例的点标为 fingertip 区")
+                    help="近 +X 端这一比例标为指尖区(tip)")
+    ap.add_argument("--rear-frac", type=float, default=0.33,
+                    help="近 -X 端这一比例标为后部区(rear); 中间为 middle")
     ap.add_argument("-o", "--out", default="gripper_geom/get.npy")
     ap.add_argument("--plot", default="gripper_geom/get.png")
     args = ap.parse_args()
@@ -153,6 +172,7 @@ def main():
         finger_id = (pts[:, 1] < 0).astype(np.int8)
         meta_extra = {"opening": "as-built", "asm_approach": args.asm_approach,
                       "asm_open": args.asm_open}
+        aligned_mesh = load_aligned_mesh(args.assembly, args.units, M)   # 同公共系的 mesh
     else:                                            # 方式B: 两个 finger STL 按 opening 装配
         lp = load_points(args.left, args.n, args.units)
         rp = load_points(args.right, args.n, args.units)
@@ -167,9 +187,10 @@ def main():
         pts = np.concatenate(pts_list).astype(np.float32)
         finger_id = np.array(finger_id, np.int8)        # 0=left, 1=right
         meta_extra = {"opening": args.opening}
+        aligned_mesh = None   # 两指模式暂不导出对齐 mesh
 
-    # 区域: 公共系接近=+X, 指尖在 +X 端(X≈0), 夹爪体往 -X 延伸。近 +X 端 tip_frac 标为指尖区。
-    region = region_by_x(pts[:, 0], args.tip_frac)    # 0=fingertip 区, 1=后部(rear)
+    # 区域: 公共系接近=+X, 指尖在 +X 端。3 段: 0=指尖 1=中部 2=后部
+    region = region_by_x(pts[:, 0], args.tip_frac, args.rear_frac)
 
     anchors = {
         "tcp": [0.0, 0.0, 0.0],
@@ -188,14 +209,20 @@ def main():
     print(f"  公共系 bbox: min={np.round(pts.min(0),4).tolist()} "
           f"max={np.round(pts.max(0),4).tolist()}")
     print(f"  anchors: {anchors}")
+    if aligned_mesh is not None:                      # 导出与点云同坐标系的 mesh, 供 view_descriptor 并排显示
+        mp = out.with_name(out.stem + "_mesh.ply")
+        aligned_mesh.export(mp)
+        print(f"  ✓ 对齐 mesh: {mp}")
 
     # ---- 验证图: 左=本爪(按区域上色)+TCP+坐标轴; 右=和 parallel.npy 并排 ----
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    palette = np.array(["#d62728", "#ff7f0e", "#7f7f7f"])   # 0=指尖红 1=中部橙 2=后部灰
+
     def draw(ax, P, fid, reg, title):
-        col = np.where(reg == 0, "tab:red", "tab:gray")           # 指尖红, 后部灰
+        col = palette[np.asarray(reg).astype(int)]
         ax.scatter(P[:, 0], P[:, 1], P[:, 2], s=2, c=col)
         ax.scatter([0], [0], [0], s=120, marker="*", c="k")       # TCP
         L = 0.04
@@ -212,13 +239,13 @@ def main():
 
     fig = plt.figure(figsize=(14, 6))
     ax1 = fig.add_subplot(121, projection="3d")
-    draw(ax1, pts, finger_id, region, f"{args.name} (red=fingertip, gray=rear, *=TCP)")
+    draw(ax1, pts, finger_id, region, f"{args.name} (red=tip, orange=middle, gray=rear, *=TCP)")
     ax2 = fig.add_subplot(122, projection="3d")
     par = pathlib.Path("gripper_geom/parallel.npy")
     if par.exists():
         d = np.load(par, allow_pickle=True).item()
         pp = np.asarray(d["points"])
-        rr = region_by_x(pp[:, 0], args.tip_frac)   # 用同一套规则重算, 才能和 GET 对比
+        rr = region_by_x(pp[:, 0], args.tip_frac, args.rear_frac)   # 同规则重算, 才能和 GET 对比
         draw(ax2, pp, None, rr, "parallel.npy (compare orientation)")
     fig.tight_layout()
     fig.savefig(args.plot, dpi=110)

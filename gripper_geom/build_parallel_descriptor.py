@@ -96,8 +96,10 @@ def main():
     finger_id = np.concatenate(
         [np.full(len(p), fid_map.get(name, -1)) for name, p in parts]).astype(np.int8)
     x = pts[:, 0]
-    span = float(x.max() - x.min())
-    region = (x < x.max() - 0.33 * span).astype(np.int8)
+    lo, hi = x.min(), x.max(); span = float(hi - lo) or 1.0
+    region = np.ones(len(x), np.int8)            # 1=中部 middle
+    region[x >= hi - 0.33 * span] = 0            # 0=指尖 tip(近+X)
+    region[x <= lo + 0.33 * span] = 2            # 2=后部 rear(近-X)
     names = [name for name, _ in parts]
 
     # 功能区锚点: 每个指的"指尖"= 离整体质心最远的点(snap 在表面上, 因为就是采样点本身)
@@ -112,6 +114,25 @@ def main():
                        "finger_id": finger_id, "part_names": names, "anchors": anchors,
                        "frame": args.frame, "opening": q}, allow_pickle=True)
     print(f">>> 已存描述符: {args.out}")
+
+    # 导出与点云同坐标系的 mesh(供 view_descriptor 并排显示): 对完整 mesh 施加同一变换链
+    import trimesh as _tm
+
+    def _aligned_mesh(name, T_l6):
+        m = _tm.load(str(mdir / f"{name}.obj"), force="mesh")
+        m.apply_transform(T_l6)
+        if args.frame == "end_effector":
+            m.apply_transform(T_ee_l6)
+        if any(abs(a) > 1e-6 for a in args.tcp_rpy):
+            Te = np.eye(4); Te[:3, :3] = rpy_to_R(*np.radians(args.tcp_rpy)); m.apply_transform(Te)
+        return m
+
+    _meshes = [_aligned_mesh("left", T_l6_left), _aligned_mesh("right", T_l6_right)]
+    if args.include_link6:
+        _meshes.insert(0, _aligned_mesh("link6", T(np.eye(3), [0, 0, 0])))
+    _mp = pathlib.Path(args.out).with_name(pathlib.Path(args.out).stem + "_mesh.ply")
+    _tm.util.concatenate(_meshes).export(_mp)
+    print(f"    ✓ 对齐 mesh: {_mp}")
     print(f"    点云 {pts.shape}  parts={names}  frame={args.frame}  opening={q}")
     print(f"    包围盒(m) min={pts.min(0).round(3).tolist()} max={pts.max(0).round(3).tolist()}")
     for k, v in anchors.items():

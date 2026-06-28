@@ -177,3 +177,4 @@ airbot_logs/
 gripper_geom/*.npy
 gripper_geom/*.npz
 gripper_geom/*.png
+gripper_geom/*.ply
