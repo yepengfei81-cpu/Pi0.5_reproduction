@@ -7,12 +7,23 @@
 结构刻意对齐 airbot_play_policy.AirbotPlayInputs/Outputs，便于对照。
 """
 import dataclasses
+import pathlib
+import sys
 
 import einops
 import numpy as np
 
 from openpi import transforms
 from openpi.models import model as _model
+
+# 复用 gripper_geom/gripper_aug.py —— 训练与离线可视化共用同一套点云增强(单一真源)
+_GG = pathlib.Path(__file__).resolve().parents[3] / "gripper_geom"
+if str(_GG) not in sys.path:
+    sys.path.insert(0, str(_GG))
+try:
+    from gripper_aug import augment_cloud as _augment_cloud
+except Exception:  # noqa: BLE001
+    _augment_cloud = None
 
 
 def make_airbot_eef_example() -> dict:
@@ -44,6 +55,21 @@ class AirbotEEFInputs(transforms.DataTransformFn):
     # 多把爪共训: gripper_clouds (G,P,3) 查表, 按每帧 observation/gripper_id 选第几把爪。
     # 与 gripper_pc 互斥(给了 gripper_clouds 就用它)。部署单爪时 gripper_id 缺省=0。
     gripper_clouds: np.ndarray | None = None
+    # 训练时是否对(查表/常量)夹爪点云做几何增强; 部署(obs 直接给点云)分支永不增强。
+    augment: bool = False
+
+    def _aug(self, cloud: np.ndarray) -> np.ndarray:
+        """train-only 几何增强 + 重采样回原点数(dropout 改了点数也保持固定 P)。"""
+        if not self.augment:
+            return cloud
+        if _augment_cloud is None:
+            raise RuntimeError("augment=True 但导入不到 gripper_geom/gripper_aug.py")
+        P = cloud.shape[0]
+        a = _augment_cloud(cloud)                     # finger_id=None -> 按 sign(Y) 开合; 用锁定默认范围
+        if len(a) != P:
+            idx = np.random.default_rng().choice(len(a), P, replace=len(a) < P)
+            a = a[idx]
+        return np.asarray(a, np.float32)
 
     def __call__(self, data: dict) -> dict:
         base_image = _parse_image(data["observation/image"])
@@ -68,15 +94,15 @@ class AirbotEEFInputs(transforms.DataTransformFn):
             },
         }
 
-        # 部署/zero-shot: obs 直接带 gripper_pc(当前夹爪甚至未见爪的描述符), 优先用
+        # 部署/zero-shot: obs 直接带 gripper_pc(当前夹爪甚至未见爪的描述符), 优先用, 不增强
         if data.get("observation/gripper_pc") is not None:
             inputs["gripper_pc"] = np.asarray(data["observation/gripper_pc"], np.float32)
         elif self.gripper_clouds is not None:
             gid = int(np.asarray(data.get("observation/gripper_id", 0)).reshape(-1)[0])
             gid = min(max(gid, 0), len(self.gripper_clouds) - 1)
-            inputs["gripper_pc"] = np.asarray(self.gripper_clouds[gid], np.float32)
+            inputs["gripper_pc"] = self._aug(np.asarray(self.gripper_clouds[gid], np.float32))
         elif self.gripper_pc is not None:
-            inputs["gripper_pc"] = np.asarray(self.gripper_pc, np.float32)
+            inputs["gripper_pc"] = self._aug(np.asarray(self.gripper_pc, np.float32))
 
         if "actions" in data:
             inputs["actions"] = data["actions"]

@@ -78,14 +78,26 @@ def parse_args():
     parser.add_argument("--no-display", action="store_true",
                         help="禁用相机可视化窗口")
     parser.add_argument("--follow-gripper", type=str, default="parallel",
-                        help="follow 臂上装的爪名(读 gripper_params.py 的开合范围); 默认 parallel")
+                        help="[单臂] follow 臂上装的爪名(读 gripper_params.py 的开合范围); 默认 parallel")
+    # ===== 双臂模式 =====
+    parser.add_argument("--dual-arm", action="store_true",
+                        help="双臂采集: 两对 lead-follow + 环境相机 + 两个手眼; 输出 state_eef_0/1 + wrist_image_1")
+    parser.add_argument("--lead-port1", type=int, default=50053, help="[双臂] 臂1 lead 端口")
+    parser.add_argument("--follow-port1", type=int, default=50052, help="[双臂] 臂1 follow 端口")
+    parser.add_argument("--wrist-serial1", type=str, default=None,
+                        help="[双臂] 臂1 手眼相机 SN(必填); 环境相机沿用 --head, 臂0 手眼沿用默认")
+    parser.add_argument("--arm0-gripper", type=str, default="get",
+                        help="[双臂] 臂0(主/持刀)爪名; 默认 get")
+    parser.add_argument("--arm1-gripper", type=str, default="parallel",
+                        help="[双臂] 臂1(按压/拉开)爪名; 默认 parallel")
     return parser.parse_args()
 
 
 class DualCamera:
     """管理两个 D405 相机"""
 
-    def __init__(self, head_serial=HEAD_CAMERA_SERIAL, wrist_serial=WRIST_CAMERA_SERIAL):
+    def __init__(self, head_serial=HEAD_CAMERA_SERIAL, wrist_serial=WRIST_CAMERA_SERIAL,
+                 wrist1_serial=None):
         import pyrealsense2 as rs
 
         self.rs = rs
@@ -97,7 +109,11 @@ class DualCamera:
         serials = [dev.get_info(rs.camera_info.serial_number) for dev in devices]
         logger.info(f"检测到 {len(serials)} 个 RealSense 设备: {serials}")
 
-        for name, serial in [("head", head_serial), ("wrist", wrist_serial)]:
+        # wrist1 仅双臂模式给; None 则不启动(单臂行为不变)
+        cam_list = [("head", head_serial), ("wrist", wrist_serial)]
+        if wrist1_serial is not None:
+            cam_list.append(("wrist1", wrist1_serial))
+        for name, serial in cam_list:
             if serial is None:
                 continue
             if serial not in serials:
@@ -127,6 +143,18 @@ class DualCamera:
         head_bgr = frames.get("head", np.zeros((480, 640, 3), dtype=np.uint8))
         wrist_bgr = frames.get("wrist", np.zeros((480, 640, 3), dtype=np.uint8))
         return head_bgr, wrist_bgr
+
+    def get_frames_dual(self):
+        """双臂: 返回 head(env), wrist0(臂0), wrist1(臂1) 三路 BGR。"""
+        frames = {}
+        for name, pipeline in self.pipelines.items():
+            frameset = pipeline.wait_for_frames(timeout_ms=1000)
+            aligned = self.aligns[name].process(frameset)
+            color = aligned.get_color_frame()
+            if color:
+                frames[name] = np.asanyarray(color.get_data())
+        z = np.zeros((480, 640, 3), dtype=np.uint8)
+        return frames.get("head", z), frames.get("wrist", z), frames.get("wrist1", z)
 
     def stop(self):
         for pipeline in self.pipelines.values():
@@ -397,8 +425,225 @@ def write_episode(dataset, frames, task):
     dataset.save_episode()
 
 
+# ======================== 双臂采集 ========================
+def lead_grip_to_follow_r(lead_g, fmin, fmax):
+    """按给定该臂 follow 爪的 [fmin,fmax] 量程映射 lead 夹爪(每臂各自范围)。"""
+    frac = float(np.clip(lead_g / LEAD_GRIPPER_MAX, 0.0, 1.0))
+    return float(fmin + frac * (fmax - fmin))
+
+
+def show_camera_view_dual(head, w0, w1, ep, fc, freq):
+    hs = cv2.resize(head, (320, 240)); a = cv2.resize(w0, (320, 240)); b = cv2.resize(w1, (320, 240))
+    cv2.putText(hs, "Env", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.putText(a, "Wrist0 (arm0)", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    cv2.putText(b, "Wrist1 (arm1)", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    cv2.putText(hs, f"Ep:{ep} F:{fc} {fc/freq:.1f}s", (10, 230),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+    cv2.imshow("Data Collection", np.hstack([hs, a, b])); cv2.waitKey(1)
+
+
+def collect_episode_dual(arms, cameras, record_freq, control_freq, episode_num, show_display):
+    """双臂录制。arms=[(lead,follow,fmin,fmax), ...]。返回 frames 或 None。
+    每帧: head_rgb + wrist_rgb_0/1 + state_eef_0/1(follow实际) + action_eef_0/1(lead指令)。"""
+    import select
+    import sys
+    from airbot_py.arm import RobotMode, SpeedProfile
+
+    for lead, follow, _fmin, _fmax in arms:               # 对齐 + 伺服模式
+        lj = lead.get_joint_pos(); fj = follow.get_joint_pos()
+        if lj is not None and fj is not None and sum(abs(a - b) for a, b in zip(lj, fj)) > 0.1:
+            follow.switch_mode(RobotMode.PLANNING_POS)
+            follow.move_to_joint_pos(lj, blocking=True); time.sleep(0.5)
+        follow.switch_mode(RobotMode.SERVO_JOINT_POS); follow.set_speed_profile(SpeedProfile.FAST)
+
+    if show_display:
+        h, w0, w1 = cameras.get_frames_dual(); show_camera_view_dual(h, w0, w1, episode_num, 0, record_freq)
+    logger.info(">>> 按 Enter 开始录制（双手移动两个 Lead 臂）...")
+    input()
+
+    frames = []; control_dt = 1.0 / control_freq; record_interval = control_freq // record_freq
+    step = 0; recording = True
+    logger.info("录制中... 按 Enter 结束并保存")
+    try:
+        while recording:
+            t0 = time.monotonic()
+            grips = []
+            for lead, follow, fmin, fmax in arms:          # 两臂各自 lead->follow
+                lj = lead.get_joint_pos(); le = lead.get_eef_pos()
+                g = lead_grip_to_follow_r(le[0], fmin, fmax) if le is not None and len(le) > 0 else 0.0
+                grips.append(g)
+                if lj is not None:
+                    follow.servo_joint_pos(lj)
+                if le is not None and len(le) > 0:
+                    follow.servo_eef_pos([g])
+
+            if step % record_interval == 0:
+                recs = []; ok = True
+                for ai, (lead, follow, _fmin, _fmax) in enumerate(arms):
+                    fe = follow.get_eef_pos(); fp = follow.get_end_pose(); lp = lead.get_end_pose()
+                    if fe is None or fp is None or lp is None:
+                        ok = False; break
+                    se = np.array(list(fp[0]) + list(fp[1]) + list(fe[:1]), dtype=np.float32)   # follow实际
+                    ae = np.array(list(lp[0]) + list(lp[1]) + [grips[ai]], dtype=np.float32)    # lead指令
+                    recs.append((se, ae))
+                if ok:
+                    h, w0, w1 = cameras.get_frames_dual()
+                    fr = {"head_rgb": bgr_to_rgb(h), "wrist_rgb_0": bgr_to_rgb(w0), "wrist_rgb_1": bgr_to_rgb(w1)}
+                    for ai, (se, ae) in enumerate(recs):
+                        fr[f"state_eef_{ai}"] = se; fr[f"action_eef_{ai}"] = ae
+                    frames.append(fr)
+                    if show_display:
+                        show_camera_view_dual(h, w0, w1, episode_num, len(frames), record_freq)
+                    if len(frames) % record_freq == 0:
+                        logger.info(f"  已录制 {len(frames)} 帧 ({len(frames)/record_freq:.1f}s)")
+            step += 1
+            if select.select([sys.stdin], [], [], 0)[0]:
+                sys.stdin.readline(); recording = False
+            el = time.monotonic() - t0
+            if el < control_dt:
+                time.sleep(control_dt - el)
+    except KeyboardInterrupt:
+        logger.info("录制被中断，丢弃本条")
+        for _l, follow, _a, _b in arms:
+            follow.switch_mode(RobotMode.PLANNING_POS); follow.set_speed_profile(SpeedProfile.DEFAULT)
+        return None
+
+    for _l, follow, _a, _b in arms:
+        follow.switch_mode(RobotMode.PLANNING_POS); follow.set_speed_profile(SpeedProfile.DEFAULT)
+    logger.info(f"录制结束：共 {len(frames)} 帧 ({len(frames)/record_freq:.1f}s)")
+    if len(frames) < 5:
+        logger.warning("帧数太少，丢弃"); return None
+    if input("保存本条? [Enter=保存, d=丢弃]: ").strip().lower() == "d":
+        logger.info("已丢弃"); return None
+    return frames
+
+
+def create_lerobot_dataset_dual(repo_id, record_freq, output_dir=None):
+    """双臂数据集: image + wrist_image + wrist_image_1 + state_eef_0/1 + actions_eef_0/1(各8D)。
+    与 pack_lerobot.py 的双臂分支对应。"""
+    import lerobot.common.datasets.lerobot_dataset as lr_ds
+    from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
+    if not getattr(lr_ds, "_h264_patched", False):
+        _orig = lr_ds.encode_video_frames
+        def _h264(*a, **k):
+            k.setdefault("vcodec", "h264"); return _orig(*a, **k)
+        lr_ds.encode_video_frames = _h264
+        lr_ds._h264_patched = True
+
+    base = Path(output_dir) if output_dir else HF_LEROBOT_HOME
+    save_dir = base / repo_id
+    if (save_dir / "meta" / "info.json").exists():
+        import datetime
+        repo_id = f"{repo_id}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        save_dir = base / repo_id
+        logger.info(f"已有数据集存在，新建: {repo_id}")
+
+    logger.info(f"创建双臂数据集: {repo_id} (fps={record_freq})")
+    vid = lambda: {"dtype": "video", "shape": (480, 640, 3), "names": ["height", "width", "channel"]}
+    eef = lambda nm: {"dtype": "float32", "shape": (8,), "names": [nm]}
+    dataset = LeRobotDataset.create(
+        repo_id=repo_id, robot_type="airbot_play", fps=record_freq, root=save_dir,
+        features={
+            "image": vid(), "wrist_image": vid(), "wrist_image_1": vid(),
+            "state_eef_0": eef("state_eef_0"), "actions_eef_0": eef("actions_eef_0"),
+            "state_eef_1": eef("state_eef_1"), "actions_eef_1": eef("actions_eef_1"),
+        },
+        image_writer_threads=6, image_writer_processes=2,
+    )
+    return dataset, save_dir
+
+
+def write_episode_dual(dataset, frames, task):
+    for fr in frames:
+        dataset.add_frame({
+            "image": fr["head_rgb"], "wrist_image": fr["wrist_rgb_0"], "wrist_image_1": fr["wrist_rgb_1"],
+            "state_eef_0": fr["state_eef_0"], "actions_eef_0": fr["action_eef_0"],
+            "state_eef_1": fr["state_eef_1"], "actions_eef_1": fr["action_eef_1"],
+            "task": task,
+        })
+    dataset.save_episode()
+
+
+def run_dual(args):
+    """双臂采集主流程(两对 lead-follow + env + 两手眼)。"""
+    if args.wrist_serial1 is None:
+        sys.exit("--dual-arm 需要 --wrist-serial1 (臂1 手眼相机 SN)")
+    gp0 = get_params(args.arm0_gripper); gp1 = get_params(args.arm1_gripper)
+    logger.info(f"臂0 爪={args.arm0_gripper} [{gp0['close']:.4f},{gp0['open']:.4f}]  "
+                f"臂1 爪={args.arm1_gripper} [{gp1['close']:.4f},{gp1['open']:.4f}]")
+    from airbot_py.arm import AIRBOTArm, RobotMode, SpeedProfile
+
+    lead0 = AIRBOTArm(url="localhost", port=LEAD_PORT)
+    follow0 = AIRBOTArm(url="localhost", port=FOLLOW_PORT)
+    lead1 = AIRBOTArm(url="localhost", port=args.lead_port1)
+    follow1 = AIRBOTArm(url="localhost", port=args.follow_port1)
+    for a, nm in [(lead0, f"lead0:{LEAD_PORT}"), (follow0, f"follow0:{FOLLOW_PORT}"),
+                  (lead1, f"lead1:{args.lead_port1}"), (follow1, f"follow1:{args.follow_port1}")]:
+        if not a.connect():
+            sys.exit(f"无法连接 {nm}")
+        logger.info(f"{nm} 已连接")
+    arms = [(lead0, follow0, float(gp0["close"]), float(gp0["open"])),
+            (lead1, follow1, float(gp1["close"]), float(gp1["open"]))]
+
+    cameras = DualCamera(wrist1_serial=args.wrist_serial1)   # env(head) + wrist(arm0) + wrist1(arm1)
+    show_display = not args.no_display
+    if show_display:
+        cv2.namedWindow("Data Collection", cv2.WINDOW_AUTOSIZE)
+
+    dataset = None; save_dir = None; num_saved = 0
+    logger.info("=" * 60); logger.info(f"[双臂] 任务: {args.task}"); logger.info("=" * 60)
+    try:
+        for _l, follow, _a, _b in arms:
+            reset_to_home(follow)
+        while True:
+            logger.info(f"\n--- Episode {num_saved + 1} --- 按 Enter 录制, q+Enter 结束")
+            if show_display:
+                import select
+                import sys as _sys
+                while True:
+                    h, w0, w1 = cameras.get_frames_dual()
+                    show_camera_view_dual(h, w0, w1, num_saved + 1, 0, args.record_freq)
+                    if select.select([_sys.stdin], [], [], 0.03)[0]:
+                        cmd = _sys.stdin.readline().strip().lower(); break
+            else:
+                cmd = input().strip().lower()
+            if cmd == "q":
+                break
+            ep = collect_episode_dual(arms, cameras, args.record_freq, CONTROL_FREQ,
+                                      num_saved + 1, show_display)
+            if ep is not None:
+                if dataset is None:
+                    dataset, save_dir = create_lerobot_dataset_dual(
+                        args.repo_id, args.record_freq, args.output_dir)
+                write_episode_dual(dataset, ep, args.task)
+                num_saved += 1; del ep
+                logger.info(f"已保存 {num_saved} 条 -> {save_dir}")
+            for _l, follow, _a, _b in arms:
+                reset_to_home(follow)
+    except KeyboardInterrupt:
+        logger.info("\n收集被中断（已保存的不受影响）")
+    finally:
+        for _l, follow, _a, _b in arms:
+            try:
+                follow.switch_mode(RobotMode.PLANNING_POS)
+                follow.set_speed_profile(SpeedProfile.DEFAULT); follow.disconnect()
+            except Exception:
+                pass
+        for lead in (lead0, lead1):
+            try:
+                lead.disconnect()
+            except Exception:
+                pass
+        cameras.stop()
+        if show_display:
+            cv2.destroyAllWindows()
+    logger.info(f"\n完成：共 {num_saved} 条 -> {save_dir}" if num_saved else "没有收集到数据")
+
+
 def main():
     args = parse_args()
+    if args.dual_arm:                       # 双臂走独立流程; 单臂保持原样不变
+        return run_dual(args)
 
     # follow 臂当前爪的开合范围(覆盖默认平行爪), 防止对 GET 过挤压
     global FOLLOW_GRIPPER_MIN, FOLLOW_GRIPPER_MAX

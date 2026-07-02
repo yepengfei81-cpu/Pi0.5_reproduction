@@ -81,6 +81,23 @@ def make_state_action(pos, rot6d, grip01):
     return state, action
 
 
+# 单臂 10D 的"静止/rest"值: pos=0 + 单位旋转 rot6d[1,0,0,0,1,0] + grip=0。
+# 单臂样本的臂1 用它填充并 arm1_mask=0(loss/相机/token 都会屏蔽), 只是占位。
+REST10 = np.array([0, 0, 0, 1, 0, 0, 0, 1, 0, 0], np.float32)
+
+
+def to_dualarm_from_single(ep):
+    """把单臂 episode(10D) 包成双臂统一 schema:
+    臂0=真值, 臂1=rest 占位 + arm1_mask=0, 臂1 手眼=空图。就地改 ep 并返回。"""
+    n = len(ep["state"])
+    rest = np.tile(REST10, (n, 1))
+    ep["state"] = np.concatenate([np.asarray(ep["state"], np.float32), rest], axis=1)      # (n,20)
+    ep["actions"] = np.concatenate([np.asarray(ep["actions"], np.float32), rest], axis=1)  # (n,20)
+    ep["wrist_1"] = [np.zeros((OUT_H, OUT_W, 3), np.uint8)] * n
+    ep["arm1_mask"] = np.zeros(n, np.float32)
+    return ep
+
+
 # ---------------------------------------------------------------------------
 # UMI：mcap -> 帧序列
 # ---------------------------------------------------------------------------
@@ -226,10 +243,61 @@ def process_teleop_episode(parquet, img_mp4, wrist_mp4, gclose, gopen, tcp_offse
             "env_mask": np.ones(n, np.float32), "task_index": task_index}
 
 
+def _arm_state_action(se_arm, ae_arm, gclose, gopen, tcp_offset):
+    """单条臂的 (N,8)=pos3+quat4(xyzw)+grip -> 10D state/actions(W' 系, 该爪归一化)。
+    与 process_teleop_episode 的单臂逻辑一致(含动作夹爪改用 lead 指令夹爪)。"""
+    se = np.asarray(se_arm, np.float64)
+    R_tool = np.stack([quat_to_rot(*q) for q in se[:, 3:7]])
+    off = np.asarray(tcp_offset, float)
+    pos_tip = se[:, :3] + np.einsum("nij,j->ni", R_tool, off)
+    span = (gopen - gclose) or 1.0
+    pos, rot6d = build_wprime(pos_tip, R_tool)
+    grip_state = np.clip((se[:, 7] - gclose) / span, 0.0, 1.0).astype(np.float32)
+    state, action = make_state_action(pos, rot6d, grip_state)
+    if ae_arm is not None:                                   # 动作夹爪用 lead(指令)夹爪
+        ae = np.asarray(ae_arm, np.float64)
+        grip_lead = np.clip((ae[:, 7] - gclose) / span, 0.0, 1.0).astype(np.float32)
+        m = min(len(action), len(grip_lead)); action[:m, 9] = grip_lead[:m]
+    return state, action
+
+
+def process_dualarm_episode(parquet, env_mp4, wrist0_mp4, wrist1_mp4, gp0, gp1):
+    """双臂 episode(collect_data 双臂格式) -> 双臂统一 schema。
+    需要 parquet 含 state_eef_0/1(各 N×8)+ actions_eef_0/1; 三路视频(env + 两手眼)。
+    臂0/臂1 各自建 W'、各自爪归一化, 拼成 20D; arm1_mask=1。"""
+    import pyarrow.parquet as pq
+    t = pq.read_table(parquet).to_pydict()
+    if "state_eef_0" not in t or "state_eef_1" not in t:
+        print(f"  ✗ {parquet.name}: 缺 state_eef_0/1(不是双臂格式?), 跳过")
+        return None
+    task_index = int(t["task_index"][0]) if "task_index" in t else None
+    s0, a0 = _arm_state_action(t["state_eef_0"], t.get("actions_eef_0"),
+                               gp0["close"], gp0["open"], gp0["tcp_offset"])
+    s1, a1 = _arm_state_action(t["state_eef_1"], t.get("actions_eef_1"),
+                               gp1["close"], gp1["open"], gp1["tcp_offset"])
+    n = min(len(s0), len(s1))
+    state = np.concatenate([s0[:n], s1[:n]], axis=1)         # (n,20)
+    actions = np.concatenate([a0[:n], a1[:n]], axis=1)
+    env = read_video_frames(env_mp4)
+    wrist0 = read_video_frames(wrist0_mp4)
+    wrist1 = read_video_frames(wrist1_mp4)
+    n = min(n, len(env), len(wrist0), len(wrist1))
+    if n < 5:
+        print(f"  ✗ {parquet.name}: 帧数不足({n}), 跳过")
+        return None
+    return {"env": [cv2.resize(e, (OUT_W, OUT_H)) for e in env[:n]],
+            "wrist": [cv2.resize(w, (OUT_W, OUT_H)) for w in wrist0[:n]],
+            "wrist_1": [cv2.resize(w, (OUT_W, OUT_H)) for w in wrist1[:n]],
+            "state": state[:n], "actions": actions[:n],
+            "env_mask": np.ones(n, np.float32), "arm1_mask": np.ones(n, np.float32),
+            "task_index": task_index}
+
+
 # ---------------------------------------------------------------------------
 # 打包
 # ---------------------------------------------------------------------------
-def create_dataset(out_dir, repo_id):
+def create_dataset(out_dir, repo_id, dual=False):
+    """dual=False: 单臂 10D 传统 schema(兼容现有 config); dual=True: 双臂 20D schema。"""
     import lerobot.common.datasets.lerobot_dataset as lr_ds
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
     if not getattr(lr_ds, "_h264_patched", False):
@@ -238,21 +306,32 @@ def create_dataset(out_dir, repo_id):
             k.setdefault("vcodec", "h264"); return _orig(*a, **k)
         lr_ds.encode_video_frames = _h264
         lr_ds._h264_patched = True
-    return LeRobotDataset.create(
-        repo_id=repo_id, robot_type="airbot_play", fps=TARGET_FPS, root=out_dir,
-        features={
-            "image":       {"dtype": "video", "shape": (OUT_H, OUT_W, 3),
-                            "names": ["height", "width", "channel"]},
-            "wrist_image": {"dtype": "video", "shape": (OUT_H, OUT_W, 3),
-                            "names": ["height", "width", "channel"]},
+
+    vid = {"dtype": "video", "shape": (OUT_H, OUT_W, 3), "names": ["height", "width", "channel"]}
+    if dual:
+        features = {
+            "image": vid, "wrist_image": vid,     # 臂0 手眼
+            "wrist_image_1": vid,                 # 臂1 手眼(单臂=空图)
+            # 20D = 臂0(pos3+rot6d6+grip1) + 臂1(同10, 各自 W' 系)。单臂样本臂1=rest。
+            "state":   {"dtype": "float32", "shape": (20,), "names": ["state"]},
+            "actions": {"dtype": "float32", "shape": (20,), "names": ["actions"]},
+            "env_mask":  {"dtype": "float32", "shape": (1,), "names": ["env_mask"]},
+            "arm1_mask": {"dtype": "float32", "shape": (1,), "names": ["arm1_mask"]},  # 1=双臂/0=单臂
+            "gripper_id_0": {"dtype": "int64", "shape": (1,), "names": ["gripper_id_0"]},
+            "gripper_id_1": {"dtype": "int64", "shape": (1,), "names": ["gripper_id_1"]},
+        }
+    else:
+        features = {
+            "image": vid, "wrist_image": vid,
             "state":   {"dtype": "float32", "shape": (10,), "names": ["state"]},
             "actions": {"dtype": "float32", "shape": (10,), "names": ["actions"]},
             "env_mask": {"dtype": "float32", "shape": (1,), "names": ["env_mask"]},
-            # 方案C: 该帧用哪把爪(0=parallel, 1=get, ...)。顺序须与 grippers.npz 的
-            # names 及训练 config 的 gripper_names 一致。训练时按它查表选夹爪点云。
+            # 方案C: 该帧用哪把爪(0=parallel, 1=get, ...)。与 grippers.npz names / config 一致。
             "gripper_id": {"dtype": "int64", "shape": (1,), "names": ["gripper_id"]},
-        },
-        image_writer_threads=4, image_writer_processes=2,
+        }
+    return LeRobotDataset.create(
+        repo_id=repo_id, robot_type="airbot_play", fps=TARGET_FPS, root=out_dir,
+        features=features, image_writer_threads=4, image_writer_processes=2,
     )
 
 
@@ -280,17 +359,29 @@ def make_server_compatible(out_dir):
         print(f"  ✓ 兼容处理: {n} 个 parquet 特征类型 List->Sequence (服务器 datasets 3.x 可读)")
 
 
-def write_episode(dataset, ep, task, gripper_id=0):
+def write_episode(dataset, ep, task, gid0=0, gid1=0, dual=False):
+    """写入一条 episode。dual=True(20D): 单臂来源须先经 to_dualarm_from_single();
+    dual=False(10D): 直接写 ep 的 10D state/actions + gripper_id=gid0。"""
     for i in range(len(ep["state"])):
-        dataset.add_frame({
-            "image": ep["env"][i],
-            "wrist_image": ep["wrist"][i],
-            "state": ep["state"][i],
-            "actions": ep["actions"][i],
-            "env_mask": np.array([ep["env_mask"][i]], np.float32),
-            "gripper_id": np.array([gripper_id], np.int64),
-            "task": task,
-        })
+        if dual:
+            frame = {
+                "image": ep["env"][i], "wrist_image": ep["wrist"][i], "wrist_image_1": ep["wrist_1"][i],
+                "state": ep["state"][i], "actions": ep["actions"][i],
+                "env_mask": np.array([ep["env_mask"][i]], np.float32),
+                "arm1_mask": np.array([ep["arm1_mask"][i]], np.float32),
+                "gripper_id_0": np.array([gid0], np.int64),
+                "gripper_id_1": np.array([gid1], np.int64),
+                "task": task,
+            }
+        else:
+            frame = {
+                "image": ep["env"][i], "wrist_image": ep["wrist"][i],
+                "state": ep["state"][i], "actions": ep["actions"][i],
+                "env_mask": np.array([ep["env_mask"][i]], np.float32),
+                "gripper_id": np.array([gid0], np.int64),
+                "task": task,
+            }
+        dataset.add_frame(frame)
     dataset.save_episode()
 
 
@@ -302,6 +393,10 @@ def main():
                     help="遥操作 LeRobot 数据集根目录(可传多个, 如积木目录 擦黑板目录)")
     ap.add_argument("--skip-umi", action="store_true",
                     help="只打包遥操作（测试③：纯遥操作 EEF，头部相机全程有效）")
+    ap.add_argument("--dual-arm", action="store_true",
+                    help="输出双臂 20D schema(state20 + wrist_image_1 + arm1_mask + gripper_id_0/1)。"
+                         "不给=单臂 10D 传统 schema(state10+gripper_id, 兼容 pi05_cotrain_eef_grip)。"
+                         "--dualarm-dir 必须配 --dual-arm")
     ap.add_argument("-o", "--output", required=True, help="输出合并数据集目录")
     ap.add_argument("--repo-id", default="cotrain_eef")
     ap.add_argument("--umi-task", nargs="+", default=["wipe the blackboard"],
@@ -318,6 +413,15 @@ def main():
     ap.add_argument("--teleop-gripper", nargs="+", default=["parallel"])
     ap.add_argument("--teleop-task", default=None,
                     help="覆盖所有 teleop 的 prompt; 默认 None=从各源 tasks.jsonl 按 task_index 自动读")
+    # 双臂来源(collect_data 双臂格式: parquet 含 state_eef_0/1 + actions_eef_0/1, 三路视频
+    # image / wrist_image / wrist_image_1)。单臂来源会自动补臂1=rest+mask。
+    ap.add_argument("--dualarm-dir", nargs="+", default=None,
+                    help="双臂 LeRobot 数据集根目录(可多个)")
+    ap.add_argument("--dualarm-gripper", nargs=2, default=["get", "parallel"],
+                    metavar=("ARM0", "ARM1"),
+                    help="双臂: 臂0(主/持刀) 臂1(按压/拉开) 各自爪名; 应用到所有 --dualarm-dir")
+    ap.add_argument("--dualarm-task", default=None,
+                    help="覆盖双臂 prompt; 默认从各源 tasks.jsonl 按 task_index 读")
     ap.add_argument("--tcp-offset", nargs=3, type=float, default=list(DEFAULT_TCP_OFFSET))
     ap.add_argument("--align-rpy", nargs=3, type=float, default=list(DEFAULT_ALIGN_RPY))
     ap.add_argument("--robot-gripper-max", type=float, default=DEFAULT_ROBOT_GRIPPER_MAX)
@@ -354,11 +458,16 @@ def main():
     print(f"  UMI    -> {list(zip(umi_dirs, [args.gripper_names[g] for g in umi_gids], umi_tasks))}")
     print(f"  teleop -> {list(zip(args.teleop_dir, [args.gripper_names[g] for g in teleop_gids]))}")
 
+    dual = args.dual_arm
+    if args.dualarm_dir and not dual:
+        sys.exit("--dualarm-dir 需要 --dual-arm(20D schema); 单臂 10D 不能含双臂数据")
+    print(f"输出 schema: {'双臂 20D' if dual else '单臂 10D(兼容 pi05_cotrain_eef_grip)'}")
+
     R_align = rpy_to_rot(*args.align_rpy)
     out_dir = Path(args.output).expanduser().resolve()
-    dataset = create_dataset(out_dir, args.repo_id)
+    dataset = create_dataset(out_dir, args.repo_id, dual)
 
-    stats = {"umi": [0, 0], "teleop": [0, 0]}   # [episodes, frames]
+    stats = {"umi": [0, 0], "teleop": [0, 0], "dual": [0, 0]}   # [episodes, frames]
 
     # ---- UMI (每目录: 自己的 prompt + 爪; 多任务=多目录) ----
     if not umi_dirs:
@@ -375,7 +484,8 @@ def main():
                                      undistort=not args.no_undistort)
             if ep is None:
                 continue
-            write_episode(dataset, ep, utask, gripper_id=ugid)
+            write_episode(dataset, to_dualarm_from_single(ep) if dual else ep,
+                          utask, gid0=ugid, gid1=0, dual=dual)
             stats["umi"][0] += 1; stats["umi"][1] += len(ep["state"])
             print(f"    ✓ {m.name}: {len(ep['state'])} 帧")
 
@@ -407,16 +517,49 @@ def main():
                 task = src_tasks.get(ti) if ti is not None else None
                 if task is None:
                     print(f"    ✗ {stem}: 源无 task(index={ti}), 跳过"); continue
-            write_episode(dataset, ep, task, gripper_id=teleop_gid)
+            write_episode(dataset, to_dualarm_from_single(ep) if dual else ep,
+                          task, gid0=teleop_gid, gid1=0, dual=dual)
             stats["teleop"][0] += 1; stats["teleop"][1] += len(ep["state"])
             print(f"    ✓ {stem}: {len(ep['state'])} 帧  task='{task}'")
 
-    uf, tf = stats["umi"][1], stats["teleop"][1]
-    tot = uf + tf
+    # ---- 双臂(collect_data 双臂格式: state_eef_0/1 + 两手眼视频) ----
+    if args.dualarm_dir:
+        gp0 = get_params(args.dualarm_gripper[0]); gp1 = get_params(args.dualarm_gripper[1])
+        gid0 = gid_of(args.dualarm_gripper[0]); gid1 = gid_of(args.dualarm_gripper[1])
+        droots = [Path(d).expanduser() for d in args.dualarm_dir]
+        print(f"\n=== 双臂: {len(droots)} 个目录  臂0={args.dualarm_gripper[0]} 臂1={args.dualarm_gripper[1]} ===")
+        for droot in droots:
+            src_tasks = load_source_tasks(droot)
+            pqs = sorted((droot / "data").rglob("episode_*.parquet"))
+            if args.limit:
+                pqs = pqs[:args.limit]
+            print(f"  [{droot.name}] {len(pqs)} 条")
+            for pqf in pqs:
+                stem = pqf.stem; sub = pqf.parent.name
+                env_mp4 = droot / "videos" / sub / "image" / f"{stem}.mp4"
+                w0 = droot / "videos" / sub / "wrist_image" / f"{stem}.mp4"
+                w1 = droot / "videos" / sub / "wrist_image_1" / f"{stem}.mp4"
+                if not (env_mp4.exists() and w0.exists() and w1.exists()):
+                    print(f"    ✗ {stem}: 缺视频(需 image/wrist_image/wrist_image_1), 跳过"); continue
+                ep = process_dualarm_episode(pqf, env_mp4, w0, w1, gp0, gp1)
+                if ep is None:
+                    continue
+                task = args.dualarm_task
+                if task is None:
+                    ti = ep.get("task_index")
+                    task = src_tasks.get(ti) if ti is not None else None
+                    if task is None:
+                        print(f"    ✗ {stem}: 源无 task, 跳过"); continue
+                write_episode(dataset, ep, task, gid0=gid0, gid1=gid1, dual=True)
+                stats["dual"][0] += 1; stats["dual"][1] += len(ep["state"])
+                print(f"    ✓ {stem}: {len(ep['state'])} 帧  task='{task}'")
+
+    uf, tf, df = stats["umi"][1], stats["teleop"][1], stats["dual"][1]
+    tot = uf + tf + df
     print(f"\n===== 打包完成 =====")
-    print(f"  UMI:    {stats['umi'][0]} 条 / {uf} 帧 ({uf/max(tot,1)*100:.0f}%)")
-    print(f"  遥操作: {stats['teleop'][0]} 条 / {tf} 帧 ({tf/max(tot,1)*100:.0f}%)")
-    print(f"  真实混合比例(按帧) UMI:遥操作 = {uf}:{tf} ≈ {uf/max(tf,1):.2f}:1")
+    print(f"  UMI:      {stats['umi'][0]} 条 / {uf} 帧 ({uf/max(tot,1)*100:.0f}%)")
+    print(f"  单臂遥操作: {stats['teleop'][0]} 条 / {tf} 帧 ({tf/max(tot,1)*100:.0f}%)")
+    print(f"  双臂:      {stats['dual'][0]} 条 / {df} 帧 ({df/max(tot,1)*100:.0f}%)")
     print(f"  输出: {out_dir}")
 
     make_server_compatible(out_dir)   # 自动降级 List->Sequence, 服务器可直接训练
@@ -434,7 +577,15 @@ def verify_dataset(out_dir, repo_id):
     t = pq.read_table(pqs[0]).to_pydict()
     st = np.array(t["state"]); ac = np.array(t["actions"]); em = np.array(t["env_mask"])
     print(f"  state shape={st.shape}  actions shape={ac.shape}  env_mask[0]={em[0]}")
-    print(f"  state[0]={np.round(st[0],3).tolist()}")
+    if st.shape[1] >= 20:                     # 双臂 20D
+        a1 = np.array(t.get("arm1_mask", [[0]]))
+        g0 = np.array(t.get("gripper_id_0", [[-1]])); g1 = np.array(t.get("gripper_id_1", [[-1]]))
+        print(f"  arm1_mask[0]={a1[0]}  gripper_id_0[0]={g0[0]}  gripper_id_1[0]={g1[0]}")
+        print(f"  臂0 state[0]={np.round(st[0][:10],3).tolist()}")
+        print(f"  臂1 state[0]={np.round(st[0][10:],3).tolist()}  (单臂应=rest[0,0,0,1,0,0,0,1,0,0])")
+    else:                                     # 单臂 10D
+        gid = np.array(t.get("gripper_id", [[-1]]))
+        print(f"  gripper_id[0]={gid[0]}  state[0]={np.round(st[0],3).tolist()}")
     # 解码一帧确认视频可读
     for sub in ("wrist_image", "image"):
         v = sorted((out_dir / "videos").rglob(f"{sub}/*.mp4"))

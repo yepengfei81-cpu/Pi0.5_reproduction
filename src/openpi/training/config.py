@@ -413,6 +413,9 @@ class LeRobotAirbotEEFDataConfig(DataConfigFactory):
     grippers_npz_path: str | None = None
     gripper_names: tuple[str, ...] = ("parallel", "get")
     num_gripper_points: int = 512
+    # 训练时对夹爪点云做几何增强(jitter/dropout/开合/scale/微旋转, 见 gripper_geom/gripper_aug.py);
+    # 只在训练的查表/常量分支生效, 部署(obs 直接给点云)不增强。默认 False = 现状不变。
+    gripper_aug: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -452,7 +455,8 @@ class LeRobotAirbotEEFDataConfig(DataConfigFactory):
         data_transforms = _transforms.Group(
             inputs=[airbot_eef_policy.AirbotEEFInputs(
                 model_type=model_config.model_type,
-                gripper_pc=gripper_pc, gripper_clouds=gripper_clouds)],
+                gripper_pc=gripper_pc, gripper_clouds=gripper_clouds,
+                augment=self.gripper_aug)],
             outputs=[airbot_eef_policy.AirbotEEFOutputs()],
         )
         # 注意: EEF 用 W' 相对系(已去掉全局偏移), 且 rot6d 不适合做差分, 故不加
@@ -1172,6 +1176,37 @@ _CONFIGS = [
             grippers_npz_path="gripper_geom/grippers.npz",
             gripper_names=("parallel", "get"),
             num_gripper_points=512,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # 方案C + 点云增强: 同 pi05_cotrain_eef_grip, 但训练时对夹爪点云做几何增强
+    # (jitter/dropout/开合/scale/微旋转, 见 gripper_geom/gripper_aug.py; 部署喂干净点云)。
+    # 与 pi05_cotrain_eef_grip 做 A/B, 看增强是否有益 / 是否伤害成功率。
+    TrainConfig(
+        name="pi05_cotrain_eef_grip_aug",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            gripper_token=True,
+            num_gripper_points=512,
+        ),
+        data=LeRobotAirbotEEFDataConfig(
+            repo_id="cotrain_eef",
+            grippers_npz_path="gripper_geom/grippers.npz",
+            gripper_names=("parallel", "get"),
+            num_gripper_points=512,
+            gripper_aug=True,
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
