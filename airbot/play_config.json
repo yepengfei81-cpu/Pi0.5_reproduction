@@ -6,7 +6,8 @@
   },
   "cameras": {
     "head_serial": "230422271972",
-    "wrist_serial": "230422271433"
+    "wrist_serial": "230422271433",
+    "left_wrist_serial": "218622271178"
   },
   "workspace": {
     "bounds_min": [0.15, -0.22, -0.065],

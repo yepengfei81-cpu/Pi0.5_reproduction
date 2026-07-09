@@ -43,8 +43,9 @@ LEAD_PORT = 50051       # Replay 无动力臂
 FOLLOW_PORT = 50050     # Play 有动力臂
 CONTROL_FREQ = 100      # 遥操作控制频率 Hz
 RECORD_FREQ = 10        # 数据记录频率 Hz
-HEAD_CAMERA_SERIAL = "230422271972"
-WRIST_CAMERA_SERIAL = "230422271433"
+HEAD_CAMERA_SERIAL = "230422271972"        # 环境(头)相机
+WRIST_CAMERA_SERIAL = "230422271433"       # 右臂(arm0)手眼
+LEFT_WRIST_CAMERA_SERIAL = "218622271178"  # 左臂(arm1)手眼(fw 5.17, 新接入的第3个)
 HOME_JOINT = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # 零位关节角
 
 # 夹爪量程对齐(固定修正)：厂家把 lead(Replay)和 follow(Play)夹爪的全开宽度设计得
@@ -84,8 +85,8 @@ def parse_args():
                         help="双臂采集: 两对 lead-follow + 环境相机 + 两个手眼; 输出 state_eef_0/1 + wrist_image_1")
     parser.add_argument("--lead-port1", type=int, default=50053, help="[双臂] 臂1 lead 端口")
     parser.add_argument("--follow-port1", type=int, default=50052, help="[双臂] 臂1 follow 端口")
-    parser.add_argument("--wrist-serial1", type=str, default=None,
-                        help="[双臂] 臂1 手眼相机 SN(必填); 环境相机沿用 --head, 臂0 手眼沿用默认")
+    parser.add_argument("--wrist-serial1", type=str, default=LEFT_WRIST_CAMERA_SERIAL,
+                        help="[双臂] 臂1 手眼相机 SN; 默认使用 LEFT_WRIST_CAMERA_SERIAL 常量")
     parser.add_argument("--arm0-gripper", type=str, default="get",
                         help="[双臂] 臂0(主/持刀)爪名; 默认 get")
     parser.add_argument("--arm1-gripper", type=str, default="parallel",
@@ -103,6 +104,7 @@ class DualCamera:
         self.rs = rs
         self.pipelines = {}
         self.aligns = {}
+        self._last = {}          # 每个相机上一帧(取帧超时时复用, 避免整条采集崩)
 
         ctx = rs.context()
         devices = ctx.query_devices()
@@ -130,31 +132,32 @@ class DualCamera:
                 pipeline.wait_for_frames()
             logger.info(f"{name} 相机已就绪 (SN: {serial})")
 
+    def _grab(self, name, pipeline, timeout_ms=2000):
+        """取一帧; 超时/无帧则打印是哪个相机 + 复用上一帧, 不让整条采集崩。"""
+        z = np.zeros((480, 640, 3), dtype=np.uint8)
+        try:
+            frameset = pipeline.wait_for_frames(timeout_ms=timeout_ms)
+            color = self.aligns[name].process(frameset).get_color_frame()
+            if color:
+                img = np.asanyarray(color.get_data())
+                self._last[name] = img
+                return img
+            logger.warning(f"⚠ 相机 '{name}' 无 color frame, 复用上一帧")
+        except RuntimeError as e:
+            logger.warning(f"⚠ 相机 '{name}' 取帧超时({e}), 复用上一帧 (USB 带宽/供电?)")
+        return self._last.get(name, z)
+
     def get_frames(self):
         """返回 head_bgr, wrist_bgr (numpy BGR uint8, H×W×3)"""
-        frames = {}
-        for name, pipeline in self.pipelines.items():
-            frameset = pipeline.wait_for_frames(timeout_ms=1000)
-            aligned = self.aligns[name].process(frameset)
-            color = aligned.get_color_frame()
-            if color:
-                frames[name] = np.asanyarray(color.get_data())
-
-        head_bgr = frames.get("head", np.zeros((480, 640, 3), dtype=np.uint8))
-        wrist_bgr = frames.get("wrist", np.zeros((480, 640, 3), dtype=np.uint8))
-        return head_bgr, wrist_bgr
+        f = {n: self._grab(n, p) for n, p in self.pipelines.items()}
+        z = np.zeros((480, 640, 3), dtype=np.uint8)
+        return f.get("head", z), f.get("wrist", z)
 
     def get_frames_dual(self):
         """双臂: 返回 head(env), wrist0(臂0), wrist1(臂1) 三路 BGR。"""
-        frames = {}
-        for name, pipeline in self.pipelines.items():
-            frameset = pipeline.wait_for_frames(timeout_ms=1000)
-            aligned = self.aligns[name].process(frameset)
-            color = aligned.get_color_frame()
-            if color:
-                frames[name] = np.asanyarray(color.get_data())
+        f = {n: self._grab(n, p) for n, p in self.pipelines.items()}
         z = np.zeros((480, 640, 3), dtype=np.uint8)
-        return frames.get("head", z), frames.get("wrist", z), frames.get("wrist1", z)
+        return f.get("head", z), f.get("wrist", z), f.get("wrist1", z)
 
     def stop(self):
         for pipeline in self.pipelines.values():

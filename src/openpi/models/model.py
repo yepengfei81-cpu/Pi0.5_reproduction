@@ -101,6 +101,9 @@ class Observation(Generic[ArrayT]):
 
     # 方案C: 夹爪几何点云(TCP 系, P 个点), 用于 gripper-aware token。None=不使用。
     gripper_pc: at.Float[ArrayT, "*b p 3"] | None = None
+    # 双臂: 臂1 夹爪几何点云 + arm1_mask(1=双臂有效 / 0=单臂 -> 模型屏蔽臂1 token)。
+    gripper_pc_1: at.Float[ArrayT, "*b p 3"] | None = None
+    arm1_mask: at.Float[ArrayT, "*b 1"] | None = None
 
     # pi0-fast model specific fields.
 
@@ -130,6 +133,8 @@ class Observation(Generic[ArrayT]):
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
             gripper_pc=data.get("gripper_pc"),
+            gripper_pc_1=data.get("gripper_pc_1"),
+            arm1_mask=data.get("arm1_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -210,6 +215,8 @@ def preprocess_observation(
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
         gripper_pc=observation.gripper_pc,
+        gripper_pc_1=observation.gripper_pc_1,
+        arm1_mask=observation.arm1_mask,
     )
 
 

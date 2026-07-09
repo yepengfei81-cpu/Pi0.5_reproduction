@@ -57,6 +57,9 @@ class AirbotEEFInputs(transforms.DataTransformFn):
     gripper_clouds: np.ndarray | None = None
     # 训练时是否对(查表/常量)夹爪点云做几何增强; 部署(obs 直接给点云)分支永不增强。
     augment: bool = False
+    # 双臂 20D: state=20D, 第3相机(right_wrist=wrist_image_1, mask=arm1_mask), 夹爪 token 用臂0
+    # (gripper_id_0)。臂1 的第2个 token 留到 pi0.py(stage2); 单臂样本 arm1_mask=0 屏蔽臂1相机。
+    dual: bool = False
 
     def _aug(self, cloud: np.ndarray) -> np.ndarray:
         """train-only 几何增强 + 重采样回原点数(dropout 改了点数也保持固定 P)。"""
@@ -80,29 +83,54 @@ class AirbotEEFInputs(transforms.DataTransformFn):
             np.asarray(data.get("observation/env_mask", 1.0)).reshape(-1)[0] > 0.5
         )
 
+        if self.dual:
+            # 双臂: 第3相机 = 臂1 手眼(wrist_image_1), 其 mask = arm1_mask(单臂样本=0 屏蔽)。
+            wrist1 = _parse_image(data["observation/wrist_image_1"]) if data.get(
+                "observation/wrist_image_1") is not None else np.zeros_like(base_image)
+            arm1_valid = bool(np.asarray(data.get("observation/arm1_mask", 1.0)).reshape(-1)[0] > 0.5)
+            right_wrist, right_mask = wrist1, np.bool_(arm1_valid)
+        else:
+            right_wrist = np.zeros_like(base_image)
+            right_mask = np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_
+
         inputs = {
             "state": data["observation/state"],
             "image": {
                 "base_0_rgb": base_image,
-                "left_wrist_0_rgb": wrist_image,
-                "right_wrist_0_rgb": np.zeros_like(base_image),
+                "left_wrist_0_rgb": wrist_image,     # 臂0 手眼
+                "right_wrist_0_rgb": right_wrist,    # 双臂=臂1手眼 / 单臂=空图
             },
             "image_mask": {
                 "base_0_rgb": np.bool_(env_valid),
                 "left_wrist_0_rgb": np.True_,
-                "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
+                "right_wrist_0_rgb": right_mask,
             },
         }
 
-        # 部署/zero-shot: obs 直接带 gripper_pc(当前夹爪甚至未见爪的描述符), 优先用, 不增强
+        # 夹爪几何 token。臂0(单臂=唯一)走 gripper_id / gripper_id_0; 双臂再加臂1(gripper_id_1)。
+        gid0_key = "observation/gripper_id_0" if self.dual else "observation/gripper_id"
+
+        def _cloud_from(gid_key):
+            gid = int(np.asarray(data.get(gid_key, 0)).reshape(-1)[0])
+            gid = min(max(gid, 0), len(self.gripper_clouds) - 1)
+            return self._aug(np.asarray(self.gripper_clouds[gid], np.float32))
+
+        # 臂0: 部署/zero-shot obs 直接给点云优先(不增强), 否则查表(train 增强)
         if data.get("observation/gripper_pc") is not None:
             inputs["gripper_pc"] = np.asarray(data["observation/gripper_pc"], np.float32)
         elif self.gripper_clouds is not None:
-            gid = int(np.asarray(data.get("observation/gripper_id", 0)).reshape(-1)[0])
-            gid = min(max(gid, 0), len(self.gripper_clouds) - 1)
-            inputs["gripper_pc"] = self._aug(np.asarray(self.gripper_clouds[gid], np.float32))
+            inputs["gripper_pc"] = _cloud_from(gid0_key)
         elif self.gripper_pc is not None:
             inputs["gripper_pc"] = self._aug(np.asarray(self.gripper_pc, np.float32))
+
+        # 双臂: 臂1 token(gripper_id_1 或 obs 直接给) + arm1_mask(供模型屏蔽单臂样本的臂1 token)
+        if self.dual:
+            if data.get("observation/gripper_pc_1") is not None:
+                inputs["gripper_pc_1"] = np.asarray(data["observation/gripper_pc_1"], np.float32)
+            elif self.gripper_clouds is not None:
+                inputs["gripper_pc_1"] = _cloud_from("observation/gripper_id_1")
+            inputs["arm1_mask"] = np.asarray(
+                data.get("observation/arm1_mask", 1.0), np.float32).reshape(1)
 
         if "actions" in data:
             inputs["actions"] = data["actions"]

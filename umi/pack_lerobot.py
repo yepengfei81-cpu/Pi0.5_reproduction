@@ -422,6 +422,9 @@ def main():
                     help="双臂: 臂0(主/持刀) 臂1(按压/拉开) 各自爪名; 应用到所有 --dualarm-dir")
     ap.add_argument("--dualarm-task", default=None,
                     help="覆盖双臂 prompt; 默认从各源 tasks.jsonl 按 task_index 读")
+    ap.add_argument("--dualarm-repeat", type=int, default=1,
+                    help="每条双臂 episode 写入几份(上采样, 平衡 单臂:双臂 数量)。默认1=不上采样; "
+                         "单双臂量级持平后设回 1(或不传)即可。")
     ap.add_argument("--tcp-offset", nargs=3, type=float, default=list(DEFAULT_TCP_OFFSET))
     ap.add_argument("--align-rpy", nargs=3, type=float, default=list(DEFAULT_ALIGN_RPY))
     ap.add_argument("--robot-gripper-max", type=float, default=DEFAULT_ROBOT_GRIPPER_MAX)
@@ -527,7 +530,8 @@ def main():
         gp0 = get_params(args.dualarm_gripper[0]); gp1 = get_params(args.dualarm_gripper[1])
         gid0 = gid_of(args.dualarm_gripper[0]); gid1 = gid_of(args.dualarm_gripper[1])
         droots = [Path(d).expanduser() for d in args.dualarm_dir]
-        print(f"\n=== 双臂: {len(droots)} 个目录  臂0={args.dualarm_gripper[0]} 臂1={args.dualarm_gripper[1]} ===")
+        print(f"\n=== 双臂: {len(droots)} 个目录  臂0={args.dualarm_gripper[0]} 臂1={args.dualarm_gripper[1]}"
+              f"  上采样 ×{args.dualarm_repeat} ===")
         for droot in droots:
             src_tasks = load_source_tasks(droot)
             pqs = sorted((droot / "data").rglob("episode_*.parquet"))
@@ -550,9 +554,10 @@ def main():
                     task = src_tasks.get(ti) if ti is not None else None
                     if task is None:
                         print(f"    ✗ {stem}: 源无 task, 跳过"); continue
-                write_episode(dataset, ep, task, gid0=gid0, gid1=gid1, dual=True)
-                stats["dual"][0] += 1; stats["dual"][1] += len(ep["state"])
-                print(f"    ✓ {stem}: {len(ep['state'])} 帧  task='{task}'")
+                for _r in range(max(1, args.dualarm_repeat)):     # 上采样: 同一条写 N 份
+                    write_episode(dataset, ep, task, gid0=gid0, gid1=gid1, dual=True)
+                    stats["dual"][0] += 1; stats["dual"][1] += len(ep["state"])
+                print(f"    ✓ {stem}: {len(ep['state'])} 帧 ×{max(1, args.dualarm_repeat)}  task='{task}'")
 
     uf, tf, df = stats["umi"][1], stats["teleop"][1], stats["dual"][1]
     tot = uf + tf + df

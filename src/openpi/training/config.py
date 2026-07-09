@@ -416,6 +416,9 @@ class LeRobotAirbotEEFDataConfig(DataConfigFactory):
     # 训练时对夹爪点云做几何增强(jitter/dropout/开合/scale/微旋转, 见 gripper_geom/gripper_aug.py);
     # 只在训练的查表/常量分支生效, 部署(obs 直接给点云)不增强。默认 False = 现状不变。
     gripper_aug: bool = False
+    # 双臂 20D: state/actions=20D(臂0+臂1), 3 相机(env+两手眼), arm1_mask, gripper_id_0/1。
+    # 默认 False=单臂 10D(与 pack_lerobot.py 的 --dual-arm 对应)。
+    dual: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -428,8 +431,14 @@ class LeRobotAirbotEEFDataConfig(DataConfigFactory):
             "actions": "actions",
             "prompt": "prompt",
         }
-        if self.grippers_npz_path is not None:
-            repack_map["observation/gripper_id"] = "gripper_id"   # 多爪: 每帧选第几把爪
+        if self.dual:
+            repack_map["observation/wrist_image_1"] = "wrist_image_1"   # 臂1 手眼
+            repack_map["observation/arm1_mask"] = "arm1_mask"           # 1=双臂/0=单臂
+            if self.grippers_npz_path is not None:
+                repack_map["observation/gripper_id_0"] = "gripper_id_0"
+                repack_map["observation/gripper_id_1"] = "gripper_id_1"
+        elif self.grippers_npz_path is not None:
+            repack_map["observation/gripper_id"] = "gripper_id"   # 单臂多爪: 每帧选第几把爪
         repack_transform = _transforms.Group(
             inputs=[_transforms.RepackTransform(repack_map)]
         )
@@ -456,7 +465,7 @@ class LeRobotAirbotEEFDataConfig(DataConfigFactory):
             inputs=[airbot_eef_policy.AirbotEEFInputs(
                 model_type=model_config.model_type,
                 gripper_pc=gripper_pc, gripper_clouds=gripper_clouds,
-                augment=self.gripper_aug)],
+                augment=self.gripper_aug, dual=self.dual)],
             outputs=[airbot_eef_policy.AirbotEEFOutputs()],
         )
         # 注意: EEF 用 W' 相对系(已去掉全局偏移), 且 rot6d 不适合做差分, 故不加
@@ -1211,6 +1220,38 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=30_000,
+        batch_size=32,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # 双臂 20D(stage1): 单臂300条(臂1=rest+mask) + 双臂(切橡皮泥)混训。state/actions=20D,
+    # 3 相机(env + 两手眼, 臂1相机按 arm1_mask 屏蔽), 夹爪 token 目前=臂0(stage2 再加臂1 token)。
+    # 数据用 pack_lerobot.py --dual-arm 打包成 repo_id=cotrain_dualarm。
+    TrainConfig(
+        name="pi05_cotrain_dualarm",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            gripper_token=True,
+            num_gripper_points=512,
+        ),
+        data=LeRobotAirbotEEFDataConfig(
+            repo_id="cotrain_dualarm",
+            grippers_npz_path="gripper_geom/grippers.npz",
+            gripper_names=("parallel", "get"),
+            num_gripper_points=512,
+            gripper_aug=True,
+            dual=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=35_000,
         batch_size=32,
         freeze_filter=pi0_config.Pi0Config(
             pi05=True,

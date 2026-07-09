@@ -386,6 +386,9 @@ def main():
     ap.add_argument("--board-z", type=float, default=None,
                     help="【接触任务用】示教测得的黑板面 base z(m)。给了它脚本每次自动把起点"
                          "抬到'板擦轻压黑板'的高度, 不用你手算。配 --press 调压入量")
+    ap.add_argument("--board-z-auto", action="store_true",
+                    help="【接触任务用】不手写 --board-z, 直接读 gripper_params.py 里该爪的 board_z "
+                         "(擦黑板专用; 抓积木/金字塔别开)。--board-z 显式给了则优先")
     ap.add_argument("--press", type=float, default=0.005,
                     help="板擦想压进黑板多少(m), 默认 0.005(5mm 轻压); 悬空调大, 堵转调小")
     ap.add_argument("--start-z-offset", type=float, default=0.0,
@@ -398,6 +401,8 @@ def main():
     ap.add_argument("--timeout", type=float, default=None)
     ap.add_argument("--config-name", default="pi05_cotrain_eef",
                     help="训练配置名: 协同=pi05_cotrain_eef; 测试③纯遥操作=pi05_teleop_eef")
+    ap.add_argument("--left-wrist-serial", default=None,
+                    help="左臂手眼相机 SN，优先于 play_config.json 中的 left_wrist_serial/wrist_serial")
     ap.add_argument("--gripper-pc", default=None,
                     help="当前夹爪的几何描述符 .npy(gripper_geom/*.npy)。模型开了 gripper_token "
                          "时部署必传, 告诉模型现在是哪把爪; 未见爪直接传它的 CAD npy 即可零样本")
@@ -407,22 +412,31 @@ def main():
     ap.add_argument("--no-display", action="store_true")
     args = ap.parse_args()
 
+    # board-z 解析: 显式 --board-z 优先; 否则 --board-z-auto 读该爪 gripper_params 的 board_z。
+    board_z = args.board_z
+    if board_z is None and args.board_z_auto:
+        board_z = get_params(args.gripper_name).get("board_z")
+        if board_z is None:
+            sys.exit(f"--board-z-auto: gripper_params 里 '{args.gripper_name}' 没有 board_z, 请补上或用 --board-z")
+        print(f">>> --board-z-auto: 用 {args.gripper_name} 的 board_z={board_z:+.3f}", flush=True)
+
     # min-z 解析: 给了黑板深度就自动放到板面下方 1.2cm 当安全底, 否则沿用 -0.06
     min_z = args.min_z
     if min_z is None:
-        min_z = (args.board_z - 0.012) if args.board_z is not None else -0.06
+        min_z = (board_z - 0.012) if board_z is not None else -0.06
 
     cam = json.load(open(args.play_config, encoding="utf-8")).get("cameras", {})
+    left_wrist_serial = args.left_wrist_serial or cam.get("left_wrist_serial") or cam.get("wrist_serial")
     runner = EEFInferenceRunner(
         checkpoint_dir=args.checkpoint, port=args.port, task=args.task,
-        head_serial=cam.get("head_serial"), wrist_serial=cam.get("wrist_serial"),
+        head_serial=cam.get("head_serial"), wrist_serial=left_wrist_serial,
         servo_hz=args.servo_hz, speed_profile=args.speed_profile,
         speed_scale=args.speed_scale, chunk_execute=args.chunk,
         env_mask=args.env_mask, min_z=min_z, max_step_mm=args.max_step_mm,
         dry_run=args.dry_run, no_display=args.no_display, config_path=args.play_config,
         start_joint=args.start_joint, config_name=args.config_name,
         ensemble_m=args.ensemble_m, start_z_offset=args.start_z_offset,
-        board_z=args.board_z, press=args.press, gripper_pc_path=args.gripper_pc,
+        board_z=board_z, press=args.press, gripper_pc_path=args.gripper_pc,
         gripper_name=args.gripper_name,
     )
     runner.run(num_steps=args.steps, timeout=args.timeout)

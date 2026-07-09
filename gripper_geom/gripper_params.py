@@ -5,17 +5,21 @@
                  夹爪归一化用 g01=(g-close)/(open-close); 避免对 GET 过挤压。
   tcp_offset   : 该爪指尖相对 get_end_pose 报点的偏移(EE 系, 米), pivot 标定得到。
                  parallel=0(运动学本就标定到平行爪指尖); 用来把 W' 锚到指尖、跨爪统一。
+  board_z      : 【擦黑板接触任务用】该爪擦拭时黑板面的 base z(get_end_pose 报点)。
+                 部署 --board-z-auto 读它自动配准起点高度, 免得每次重测;
+                 GET 比平行高 ~17mm(更长)。板子搬动才需重测。
 
 命名/顺序须与 grippers.npz 的 names、config.gripper_names 一致。
 新增爪: 在此加一行 + 加进 grippers.npz + config.gripper_names。
 """
 
 GRIPPER_PARAMS = {
-    "parallel": {"close": 0.0, "open": 0.073, "tcp_offset": (0.0, 0.0, 0.0)},
+    "parallel": {"close": 0.0, "open": 0.073, "tcp_offset": (0.0, 0.0, 0.0), "board_z": -0.060},
     # GET: 指尖比平行爪沿 +X(指向)多伸 17mm(安装面->指尖: GET 90.5mm vs 平行 73.5mm, 卡尺)。
     #      close/open = teach_probe 读到的 get_eef_pos: 刚闭合 8.9mm / 全开 70.1mm。
     #      (物理全开宽度卡尺量得 62mm, 仅记录; 归一化用 get_eef_pos 读数。)
-    "get":      {"close": 0.0089, "open": 0.0701, "tcp_offset": (0.017, 0.0, 0.0)},
+    #      board_z=-0.05: 指尖顶板测得 -0.044, 抓板擦擦时略高 -> -0.05(配 --press 0 起步，实测更低的数值能让模型发挥更好)。
+    "get":      {"close": 0.0089, "open": 0.0701, "tcp_offset": (0.017, 0.0, 0.0), "board_z": -0.05},
 }
 
 

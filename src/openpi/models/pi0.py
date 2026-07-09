@@ -152,12 +152,24 @@ class Pi0(_model.BaseModel):
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
 
-        # 方案C: 夹爪几何 token(和图像/文本同档: 全注意力)
+        # 方案C: 夹爪几何 token(和图像/文本同档: 全注意力)。臂0(单臂=唯一)。
         if obs.gripper_pc is not None:
             g_tok = self.gripper_encoder(obs.gripper_pc)          # (b, 1, emb)
             tokens.append(g_tok)
             input_mask.append(jnp.ones((g_tok.shape[0], g_tok.shape[1]), dtype=jnp.bool_))
             ar_mask += [False] * g_tok.shape[1]
+
+        # 双臂: 臂1 夹爪 token(共用同一 PointNet)。mask=arm1_mask: 单臂样本(=0)屏蔽此 token。
+        if obs.gripper_pc_1 is not None:
+            g_tok1 = self.gripper_encoder(obs.gripper_pc_1)       # (b, 1, emb)
+            tokens.append(g_tok1)
+            if obs.arm1_mask is not None:
+                am = jnp.asarray(obs.arm1_mask).reshape((g_tok1.shape[0], -1))[:, 0] > 0.5   # (b,)
+                m1 = einops.repeat(am, "b -> b s", s=g_tok1.shape[1])
+            else:
+                m1 = jnp.ones((g_tok1.shape[0], g_tok1.shape[1]), dtype=jnp.bool_)
+            input_mask.append(m1)
+            ar_mask += [False] * g_tok1.shape[1]
 
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
