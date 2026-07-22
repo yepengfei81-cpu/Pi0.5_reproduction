@@ -80,6 +80,10 @@ def parse_args():
                         help="禁用相机可视化窗口")
     parser.add_argument("--follow-gripper", type=str, default="parallel",
                         help="[单臂] follow 臂上装的爪名(读 gripper_params.py 的开合范围); 默认 parallel")
+    parser.add_argument("--telemetry-hz", type=int, default=100,
+                        help="遥测 sidecar 记录频率(Hz): 关节力矩(电流换算)/关节角/速度/指令角, "
+                             "存 <数据集>/telemetry/episode_XXXXXX.npz, 供 NeuralActuator 力估计等使用; "
+                             "0=关闭。若遥操作跟手性变差, 降到 50")
     # ===== 双臂模式 =====
     parser.add_argument("--dual-arm", action="store_true",
                         help="双臂采集: 两对 lead-follow + 环境相机 + 两个手眼; 输出 state_eef_0/1 + wrist_image_1")
@@ -115,22 +119,38 @@ class DualCamera:
         cam_list = [("head", head_serial), ("wrist", wrist_serial)]
         if wrist1_serial is not None:
             cam_list.append(("wrist1", wrist1_serial))
+
+        # 3 台并行启动: pipeline.start(USB协商+初始化)每台要好几秒, 串行3台=3倍慢。
+        # 各台独立 pipeline 线程安全; 每台打印耗时, 便于定位哪台慢(USB口/带宽问题)。
+        import threading
+        lock = threading.Lock()
+
+        def _start_one(name, serial):
+            t0 = time.monotonic()
+            pipeline = rs.pipeline()
+            config = rs.config()
+            config.enable_device(serial)
+            config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+            pipeline.start(config)
+            align = rs.align(rs.stream.color)
+            for _ in range(8):        # warmup: 8 帧足够自动曝光初步稳定
+                pipeline.wait_for_frames()
+            with lock:
+                self.aligns[name] = align
+                self.pipelines[name] = pipeline
+            logger.info(f"{name} 相机已就绪 (SN: {serial}, 耗时 {time.monotonic()-t0:.1f}s)")
+
+        threads = []
         for name, serial in cam_list:
             if serial is None:
                 continue
             if serial not in serials:
                 logger.warning(f"{name} 相机 SN={serial} 未找到，跳过")
                 continue
-            pipeline = rs.pipeline()
-            config = rs.config()
-            config.enable_device(serial)
-            config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-            profile = pipeline.start(config)
-            self.aligns[name] = rs.align(rs.stream.color)
-            self.pipelines[name] = pipeline
-            for _ in range(30):
-                pipeline.wait_for_frames()
-            logger.info(f"{name} 相机已就绪 (SN: {serial})")
+            th = threading.Thread(target=_start_one, args=(name, serial), daemon=True)
+            th.start(); threads.append(th)
+        for th in threads:
+            th.join()
 
     def _grab(self, name, pipeline, timeout_ms=2000):
         """取一帧; 超时/无帧则打印是哪个相机 + 复用上一帧, 不让整条采集崩。"""
@@ -192,6 +212,32 @@ def bgr_to_rgb(img):
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
+_NAN6 = [float("nan")] * 6   # 遥测某次读取失败时的占位(整行不丢, 离线可插值/剔除)
+
+
+def save_telemetry(save_dir, ep_idx, telem):
+    """遥测 sidecar 落盘: <数据集>/telemetry/episode_{ep:06d}.npz (ep 与 LeRobot episode 索引一致, 0起)。
+    与 10Hz 主记录靠 frame_idx 列对齐(每行遥测记录"当时已录多少主帧")。
+    用途: NeuralActuator 电流→力标定/离线打标 + 接触/握法分析; 不动 LeRobot 主格式。"""
+    if not telem or not telem.get("t"):
+        return
+    tdir = Path(save_dir) / "telemetry"
+    tdir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(tdir / f"episode_{ep_idx:06d}.npz",
+                        **{k: np.asarray(v, dtype=np.float32) for k, v in telem.items()})
+    readme = tdir / "README.txt"
+    if not readme.exists():
+        readme.write_text(
+            "telemetry sidecar (每 episode 一个 npz, float32; 双臂字段带 _0/_1 后缀):\n"
+            "  t          [N]    episode 内时间(s)\n"
+            "  frame_idx  [N]    该行时刻已录的 10Hz 主记录帧数(对齐用)\n"
+            "  cmd_q      [N,6]  指令关节角(lead, rad)     cmd_grip [N]   指令夹爪(m, follow量程)\n"
+            "  q          [N,6]  实际关节角(follow, rad)   dq       [N,6] 关节速度(rad/s)\n"
+            "  tau        [N,6]  关节力矩(Nm, 电流换算)    grip_q   [N]   夹爪开度(m)\n"
+            "  grip_tau   [N]    夹爪力矩(Nm)\n", encoding="utf-8")
+    logger.info(f"  遥测 sidecar: {len(telem['t'])} 行 -> telemetry/episode_{ep_idx:06d}.npz")
+
+
 def reset_to_home(follow):
     """将 Follow 臂回到零位"""
     from airbot_py.arm import RobotMode
@@ -204,10 +250,11 @@ def reset_to_home(follow):
 
 
 def collect_episode(lead, follow, cameras, record_freq, control_freq,
-                    episode_num, show_display):
+                    episode_num, show_display, telemetry_hz=0):
     """
     录制一条 episode。
-    返回: frames 列表 [{state, action, head_rgb, wrist_rgb}, ...] 或 None（丢弃）
+    返回: (frames, telem) 或 None（丢弃）。frames=[{state, action, ...}];
+    telem = 遥测 sidecar 字典(telemetry_hz>0) 或 None, 由 save_telemetry 落盘。
     """
     import select
     import sys
@@ -241,6 +288,12 @@ def collect_episode(lead, follow, cameras, record_freq, control_freq,
     record_interval = control_freq // record_freq
     step = 0
     recording = True
+    # 遥测 sidecar(默认100Hz): 力矩/角度/速度/指令角, 供 NeuralActuator 力估计等离线使用
+    telem_interval = max(1, control_freq // telemetry_hz) if telemetry_hz > 0 else 0
+    telem = ({k: [] for k in ("t", "frame_idx", "cmd_q", "cmd_grip",
+                              "q", "dq", "tau", "grip_q", "grip_tau")}
+             if telem_interval else None)
+    t_ep0 = time.monotonic()
 
     logger.info("录制中... 按 Enter 结束并保存")
 
@@ -261,6 +314,21 @@ def collect_episode(lead, follow, cameras, record_freq, control_freq,
                 follow.servo_joint_pos(lead_joints)
             if lead_eef is not None and len(lead_eef) > 0:
                 follow.servo_eef_pos([grip_follow])
+
+            # 遥测 sidecar 采样(默认每个控制周期=100Hz)
+            if telem is not None and step % telem_interval == 0:
+                _q = follow.get_joint_pos(); _dq = follow.get_joint_vel()
+                _tau = follow.get_joint_eff()
+                _ge = follow.get_eef_pos(); _gt = follow.get_eef_eff()
+                telem["t"].append(time.monotonic() - t_ep0)
+                telem["frame_idx"].append(len(frames))
+                telem["cmd_q"].append(list(lead_joints) if lead_joints is not None else _NAN6)
+                telem["cmd_grip"].append(grip_follow)
+                telem["q"].append(list(_q) if _q else _NAN6)
+                telem["dq"].append(list(_dq) if _dq else _NAN6)
+                telem["tau"].append(list(_tau) if _tau else _NAN6)
+                telem["grip_q"].append(_ge[0] if _ge else float("nan"))
+                telem["grip_tau"].append(_gt[0] if _gt else float("nan"))
 
             # 按记录频率采样数据
             if step % record_interval == 0:
@@ -340,7 +408,7 @@ def collect_episode(lead, follow, cameras, record_freq, control_freq,
         logger.info("已丢弃")
         return None
 
-    return frames
+    return frames, telem
 
 def create_lerobot_dataset(repo_id, record_freq, output_dir=None):
     """开头创建一次空数据集；之后每条 episode 立即写盘（低内存、抗崩溃）。"""
@@ -445,9 +513,11 @@ def show_camera_view_dual(head, w0, w1, ep, fc, freq):
     cv2.imshow("Data Collection", np.hstack([hs, a, b])); cv2.waitKey(1)
 
 
-def collect_episode_dual(arms, cameras, record_freq, control_freq, episode_num, show_display):
-    """双臂录制。arms=[(lead,follow,fmin,fmax), ...]。返回 frames 或 None。
-    每帧: head_rgb + wrist_rgb_0/1 + state_eef_0/1(follow实际) + action_eef_0/1(lead指令)。"""
+def collect_episode_dual(arms, cameras, record_freq, control_freq, episode_num, show_display,
+                         telemetry_hz=0):
+    """双臂录制。arms=[(lead,follow,fmin,fmax), ...]。返回 (frames, telem) 或 None。
+    每帧: head_rgb + wrist_rgb_0/1 + state_eef_0/1(follow实际) + action_eef_0/1(lead指令)。
+    telem = 遥测 sidecar(字段带 _0/_1 后缀) 或 None。"""
     import select
     import sys
     from airbot_py.arm import RobotMode, SpeedProfile
@@ -466,19 +536,41 @@ def collect_episode_dual(arms, cameras, record_freq, control_freq, episode_num, 
 
     frames = []; control_dt = 1.0 / control_freq; record_interval = control_freq // record_freq
     step = 0; recording = True
+    telem_interval = max(1, control_freq // telemetry_hz) if telemetry_hz > 0 else 0
+    telem = ({k: [] for k in ["t", "frame_idx"]
+              + [f"{n}_{ai}" for ai in range(len(arms))
+                 for n in ("cmd_q", "cmd_grip", "q", "dq", "tau", "grip_q", "grip_tau")]}
+             if telem_interval else None)
+    t_ep0 = time.monotonic()
     logger.info("录制中... 按 Enter 结束并保存")
     try:
         while recording:
             t0 = time.monotonic()
-            grips = []
+            grips = []; cmd_qs = []
             for lead, follow, fmin, fmax in arms:          # 两臂各自 lead->follow
                 lj = lead.get_joint_pos(); le = lead.get_eef_pos()
                 g = lead_grip_to_follow_r(le[0], fmin, fmax) if le is not None and len(le) > 0 else 0.0
-                grips.append(g)
+                grips.append(g); cmd_qs.append(lj)
                 if lj is not None:
                     follow.servo_joint_pos(lj)
                 if le is not None and len(le) > 0:
                     follow.servo_eef_pos([g])
+
+            # 遥测 sidecar 采样(默认每个控制周期=100Hz, 每臂一组字段)
+            if telem is not None and step % telem_interval == 0:
+                telem["t"].append(time.monotonic() - t_ep0)
+                telem["frame_idx"].append(len(frames))
+                for ai, (_lead, follow, _fm, _fx) in enumerate(arms):
+                    _q = follow.get_joint_pos(); _dq = follow.get_joint_vel()
+                    _tau = follow.get_joint_eff()
+                    _ge = follow.get_eef_pos(); _gt = follow.get_eef_eff()
+                    telem[f"cmd_q_{ai}"].append(list(cmd_qs[ai]) if cmd_qs[ai] is not None else _NAN6)
+                    telem[f"cmd_grip_{ai}"].append(grips[ai])
+                    telem[f"q_{ai}"].append(list(_q) if _q else _NAN6)
+                    telem[f"dq_{ai}"].append(list(_dq) if _dq else _NAN6)
+                    telem[f"tau_{ai}"].append(list(_tau) if _tau else _NAN6)
+                    telem[f"grip_q_{ai}"].append(_ge[0] if _ge else float("nan"))
+                    telem[f"grip_tau_{ai}"].append(_gt[0] if _gt else float("nan"))
 
             if step % record_interval == 0:
                 recs = []; ok = True
@@ -518,7 +610,7 @@ def collect_episode_dual(arms, cameras, record_freq, control_freq, episode_num, 
         logger.warning("帧数太少，丢弃"); return None
     if input("保存本条? [Enter=保存, d=丢弃]: ").strip().lower() == "d":
         logger.info("已丢弃"); return None
-    return frames
+    return frames, telem
 
 
 def create_lerobot_dataset_dual(repo_id, record_freq, output_dir=None):
@@ -613,13 +705,16 @@ def run_dual(args):
             if cmd == "q":
                 break
             ep = collect_episode_dual(arms, cameras, args.record_freq, CONTROL_FREQ,
-                                      num_saved + 1, show_display)
+                                      num_saved + 1, show_display,
+                                      telemetry_hz=args.telemetry_hz)
             if ep is not None:
+                frames, telem = ep
                 if dataset is None:
                     dataset, save_dir = create_lerobot_dataset_dual(
                         args.repo_id, args.record_freq, args.output_dir)
-                write_episode_dual(dataset, ep, args.task)
-                num_saved += 1; del ep
+                write_episode_dual(dataset, frames, args.task)
+                save_telemetry(save_dir, num_saved, telem)   # 本条 LeRobot episode 索引 = num_saved(0起)
+                num_saved += 1; del frames, ep
                 logger.info(f"已保存 {num_saved} 条 -> {save_dir}")
             for _l, follow, _a, _b in arms:
                 reset_to_home(follow)
@@ -717,15 +812,18 @@ def main():
                 control_freq=CONTROL_FREQ,
                 episode_num=num_saved + 1,
                 show_display=show_display,
+                telemetry_hz=args.telemetry_hz,
             )
             if episode is not None:
+                frames, telem = episode
                 # 懒创建数据集 + 立即写盘（低内存、崩溃最多只丢当前这条）
                 if dataset is None:
                     dataset, save_dir = create_lerobot_dataset(
                         args.repo_id, args.record_freq, args.output_dir)
-                write_episode(dataset, episode, args.task)
+                write_episode(dataset, frames, args.task)
+                save_telemetry(save_dir, num_saved, telem)   # 本条 LeRobot episode 索引 = num_saved(0起)
                 num_saved += 1
-                del episode   # 立刻释放该条的图像内存
+                del frames, episode   # 立刻释放该条的图像内存
                 logger.info(f"已保存 {num_saved} 条 episode -> {save_dir}")
 
             # 每条 episode 结束后回零位

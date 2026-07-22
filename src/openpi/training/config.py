@@ -466,7 +466,7 @@ class LeRobotAirbotEEFDataConfig(DataConfigFactory):
                 model_type=model_config.model_type,
                 gripper_pc=gripper_pc, gripper_clouds=gripper_clouds,
                 augment=self.gripper_aug, dual=self.dual)],
-            outputs=[airbot_eef_policy.AirbotEEFOutputs()],
+            outputs=[airbot_eef_policy.AirbotEEFOutputs(dual=self.dual)],
         )
         # 注意: EEF 用 W' 相对系(已去掉全局偏移), 且 rot6d 不适合做差分, 故不加
         # DeltaActions —— 动作就是 W' 系下的绝对位姿。
@@ -1254,7 +1254,7 @@ _CONFIGS = [
         # batch48 + 33k步 ≈ batch32 + 50k步(同epoch); LR随batch按~1.4x线性缩放补偿更少的更新次数。
         num_train_steps=33_000,
         batch_size=48,
-        num_workers=16,  # 默认2太低: 加速 norm_stats 视频并行解码, 也更好地喂 2xH200 (sbatch cpus=16)
+        num_workers=8,  # 默认2太低; 16 会导致 worker spawn 的 pickle 截断, 8 稳且够喂 2xH200
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=3.5e-5,

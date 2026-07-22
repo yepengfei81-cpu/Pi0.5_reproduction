@@ -141,7 +141,13 @@ class AirbotEEFInputs(transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class AirbotEEFOutputs(transforms.DataTransformFn):
-    """返回前 10 个动作维 (pos3 + rot6d6 + gripper1)。"""
+    """返回动作维: 单臂前10维(pos3+rot6d6+grip1); 双臂前20维(臂0 10 + 臂1 10)。
+
+    dual=False 时只吐臂0的10维(与单臂部署一致); dual=True 时吐 20 维,
+    双臂部署据此把前10维发臂0、后10维发臂1。只影响推理后处理, 不改训练权重。
+    """
+    dual: bool = False
 
     def __call__(self, data: dict) -> dict:
-        return {"actions": np.asarray(data["actions"][:, :10])}
+        n = 20 if self.dual else 10
+        return {"actions": np.asarray(data["actions"][:, :n])}
