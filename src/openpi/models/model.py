@@ -99,10 +99,11 @@ class Observation(Generic[ArrayT]):
     # Tokenized prompt mask.
     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
 
-    # 方案C: 夹爪几何点云(TCP 系, P 个点), 用于 gripper-aware token。None=不使用。
-    gripper_pc: at.Float[ArrayT, "*b p 3"] | None = None
+    # 方案C: 夹爪几何点云(TCP 系), 用于 gripper-aware token。None=不使用。
+    # 全局模式 (P,3) = 1 token; 区域化模式 (3,P,3)(tip/mid/rear) = 3 token。
+    gripper_pc: at.Float[ArrayT, "*b p 3"] | at.Float[ArrayT, "*b r p 3"] | None = None
     # 双臂: 臂1 夹爪几何点云 + arm1_mask(1=双臂有效 / 0=单臂 -> 模型屏蔽臂1 token)。
-    gripper_pc_1: at.Float[ArrayT, "*b p 3"] | None = None
+    gripper_pc_1: at.Float[ArrayT, "*b p 3"] | at.Float[ArrayT, "*b r p 3"] | None = None
     arm1_mask: at.Float[ArrayT, "*b 1"] | None = None
 
     # pi0-fast model specific fields.

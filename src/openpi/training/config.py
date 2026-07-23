@@ -419,6 +419,10 @@ class LeRobotAirbotEEFDataConfig(DataConfigFactory):
     # 双臂 20D: state/actions=20D(臂0+臂1), 3 相机(env+两手眼), arm1_mask, gripper_id_0/1。
     # 默认 False=单臂 10D(与 pack_lerobot.py 的 --dual-arm 对应)。
     dual: bool = False
+    # 区域化几何 token: 每爪按 tip/mid/rear 编成 3 个 token(代替 1 个全局 token)。
+    # 开启后查表存"全爪点云+逐点区域标签"(训练先整爪增强、再按标签拆区, 防止把爪撕开),
+    # num_gripper_points 语义变为【每区】点数(建议 256)。需 grippers.npz 含 {name}_region/_finger。
+    region_tokens: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -452,11 +456,31 @@ class LeRobotAirbotEEFDataConfig(DataConfigFactory):
         # 方案C: 夹爪几何描述符。多爪(grippers.npz) 优先于单爪(单 .npy)。
         gripper_pc = None
         gripper_clouds = None
+        gripper_regions = None
+        gripper_fingers = None
         if self.grippers_npz_path is not None:
             z = np.load(self.grippers_npz_path, allow_pickle=True)
-            # 按 gripper_names 顺序堆成 (G, P, 3); 顺序须与打包时的 gripper_id 一致
-            gripper_clouds = np.stack(
-                [_subsample(z[f"{name}_points"]) for name in self.gripper_names])
+            if self.region_tokens:
+                # 区域模式: 每区分层采 2*P 点(留足 dropout 余量), 查表存全爪云+逐点标签;
+                # 拆区发生在 AirbotEEFInputs(整爪增强之后), 这里只做确定性分层采样。
+                def _strat(name):
+                    pts = np.asarray(z[f"{name}_points"], np.float32)
+                    reg = np.asarray(z[f"{name}_region"])
+                    fid = np.asarray(z[f"{name}_finger"])
+                    rng = np.random.default_rng(0)
+                    idx = np.concatenate([
+                        rng.choice(np.flatnonzero(reg == r), 2 * self.num_gripper_points,
+                                   replace=int((reg == r).sum()) < 2 * self.num_gripper_points)
+                        for r in range(3)])
+                    return pts[idx], reg[idx].astype(np.int8), fid[idx].astype(np.int8)
+                packs = [_strat(name) for name in self.gripper_names]
+                gripper_clouds = np.stack([p[0] for p in packs])    # (G, 6P, 3)
+                gripper_regions = np.stack([p[1] for p in packs])   # (G, 6P)
+                gripper_fingers = np.stack([p[2] for p in packs])   # (G, 6P)
+            else:
+                # 按 gripper_names 顺序堆成 (G, P, 3); 顺序须与打包时的 gripper_id 一致
+                gripper_clouds = np.stack(
+                    [_subsample(z[f"{name}_points"]) for name in self.gripper_names])
         elif self.gripper_pc_path is not None:
             d = np.load(self.gripper_pc_path, allow_pickle=True).item()
             gripper_pc = _subsample(d["points"])
@@ -465,6 +489,8 @@ class LeRobotAirbotEEFDataConfig(DataConfigFactory):
             inputs=[airbot_eef_policy.AirbotEEFInputs(
                 model_type=model_config.model_type,
                 gripper_pc=gripper_pc, gripper_clouds=gripper_clouds,
+                gripper_regions=gripper_regions, gripper_fingers=gripper_fingers,
+                region_tokens=self.region_tokens, region_points=self.num_gripper_points,
                 augment=self.gripper_aug, dual=self.dual)],
             outputs=[airbot_eef_policy.AirbotEEFOutputs(dual=self.dual)],
         )
@@ -1255,6 +1281,46 @@ _CONFIGS = [
         num_train_steps=33_000,
         batch_size=48,
         num_workers=8,  # 默认2太低; 16 会导致 worker spawn 的 pickle 截断, 8 稳且够喂 2xH200
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=3.5e-5,
+            decay_steps=33_000,
+            decay_lr=3.5e-6,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # 区域化几何 token: 每爪 tip/mid/rear 3 token(共享 PointNet + 零初始化区域嵌入)。
+    # 数据 = cotrain_dualarm2(300单臂 + 100旧握法regrasp + 50新握法); 其余超参同 pi05_cotrain_dualarm。
+    TrainConfig(
+        name="pi05_cotrain_dualarm_region",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            gripper_token=True,
+            num_gripper_points=256,   # 区域模式: 每区点数
+            region_tokens=True,
+        ),
+        data=LeRobotAirbotEEFDataConfig(
+            repo_id="cotrain_dualarm2",
+            grippers_npz_path="gripper_geom/grippers.npz",
+            gripper_names=("parallel", "get"),
+            num_gripper_points=256,
+            gripper_aug=True,
+            dual=True,
+            region_tokens=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=33_000,
+        batch_size=48,
+        num_workers=8,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=3.5e-5,

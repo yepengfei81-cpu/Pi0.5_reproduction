@@ -60,6 +60,13 @@ class AirbotEEFInputs(transforms.DataTransformFn):
     # 双臂 20D: state=20D, 第3相机(right_wrist=wrist_image_1, mask=arm1_mask), 夹爪 token 用臂0
     # (gripper_id_0)。臂1 的第2个 token 留到 pi0.py(stage2); 单臂样本 arm1_mask=0 屏蔽臂1相机。
     dual: bool = False
+    # 区域化 token: gripper_clouds=(G,M,3) 全爪云 + 逐点标签(M=6*region_points, 每区2倍余量)。
+    # 输出 (3, region_points, 3): 先整爪增强(标签随行过 dropout), 再按 region 拆区重采样——
+    # 顺序不能反, 逐区增强会把爪"撕开"(开合/旋转/缩放必须是整爪同一变换)。
+    gripper_regions: np.ndarray | None = None
+    gripper_fingers: np.ndarray | None = None
+    region_tokens: bool = False
+    region_points: int = 256
 
     def _aug(self, cloud: np.ndarray) -> np.ndarray:
         """train-only 几何增强 + 重采样回原点数(dropout 改了点数也保持固定 P)。"""
@@ -115,11 +122,36 @@ class AirbotEEFInputs(transforms.DataTransformFn):
             gid = min(max(gid, 0), len(self.gripper_clouds) - 1)
             return self._aug(np.asarray(self.gripper_clouds[gid], np.float32))
 
+        def _region_cloud_from(gid_key):
+            """区域模式查表: 整爪增强(标签随行) -> 按 region 拆 3 区 -> 每区重采样到定点数。"""
+            gid = int(np.asarray(data.get(gid_key, 0)).reshape(-1)[0])
+            gid = min(max(gid, 0), len(self.gripper_clouds) - 1)
+            cloud = np.asarray(self.gripper_clouds[gid], np.float32)
+            reg = np.asarray(self.gripper_regions[gid])
+            if self.augment:
+                if _augment_cloud is None:
+                    raise RuntimeError("augment=True 但导入不到 gripper_geom/gripper_aug.py")
+                fid = (np.asarray(self.gripper_fingers[gid])
+                       if self.gripper_fingers is not None else None)
+                cloud, reg = _augment_cloud(cloud, finger_id=fid, labels=reg)
+            rng = np.random.default_rng() if self.augment else np.random.default_rng(0)
+            out = []
+            for r in range(3):
+                pts = cloud[reg == r]
+                if len(pts) == 0:      # 极端退化保护(不应发生: 每区有2倍余量)
+                    pts = cloud
+                idx = rng.choice(len(pts), self.region_points,
+                                 replace=len(pts) < self.region_points)
+                out.append(pts[idx])
+            return np.stack(out).astype(np.float32)   # (3, region_points, 3)
+
+        make_cloud = _region_cloud_from if self.region_tokens else _cloud_from
+
         # 臂0: 部署/zero-shot obs 直接给点云优先(不增强), 否则查表(train 增强)
         if data.get("observation/gripper_pc") is not None:
             inputs["gripper_pc"] = np.asarray(data["observation/gripper_pc"], np.float32)
         elif self.gripper_clouds is not None:
-            inputs["gripper_pc"] = _cloud_from(gid0_key)
+            inputs["gripper_pc"] = make_cloud(gid0_key)
         elif self.gripper_pc is not None:
             inputs["gripper_pc"] = self._aug(np.asarray(self.gripper_pc, np.float32))
 
@@ -128,7 +160,7 @@ class AirbotEEFInputs(transforms.DataTransformFn):
             if data.get("observation/gripper_pc_1") is not None:
                 inputs["gripper_pc_1"] = np.asarray(data["observation/gripper_pc_1"], np.float32)
             elif self.gripper_clouds is not None:
-                inputs["gripper_pc_1"] = _cloud_from("observation/gripper_id_1")
+                inputs["gripper_pc_1"] = make_cloud("observation/gripper_id_1")
             inputs["arm1_mask"] = np.asarray(
                 data.get("observation/arm1_mask", 1.0), np.float32).reshape(1)
 

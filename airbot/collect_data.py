@@ -666,6 +666,10 @@ def run_dual(args):
     gp0 = get_params(args.arm0_gripper); gp1 = get_params(args.arm1_gripper)
     logger.info(f"臂0 爪={args.arm0_gripper} [{gp0['close']:.4f},{gp0['open']:.4f}]  "
                 f"臂1 爪={args.arm1_gripper} [{gp1['close']:.4f},{gp1['open']:.4f}]")
+    # 相机先启动、臂后连接: 相机 pipeline.start 会触发 USB 重枚举, 若与 USB-CAN 同 hub 可能
+    # 瞬断 CAN 打崩 fsm —— 先让相机把风暴掀完, 再连臂并立即使用, 不留"连上后闲置几分钟"的暴露窗口。
+    cameras = DualCamera(wrist1_serial=args.wrist_serial1)   # env(head) + wrist(arm0) + wrist1(arm1)
+
     from airbot_py.arm import AIRBOTArm, RobotMode, SpeedProfile
 
     lead0 = AIRBOTArm(url="localhost", port=LEAD_PORT)
@@ -675,12 +679,10 @@ def run_dual(args):
     for a, nm in [(lead0, f"lead0:{LEAD_PORT}"), (follow0, f"follow0:{FOLLOW_PORT}"),
                   (lead1, f"lead1:{args.lead_port1}"), (follow1, f"follow1:{args.follow_port1}")]:
         if not a.connect():
-            sys.exit(f"无法连接 {nm}")
+            sys.exit(f"无法连接 {nm} (fsm 掉了? 检查对应容器/重启 fsm)")
         logger.info(f"{nm} 已连接")
     arms = [(lead0, follow0, float(gp0["close"]), float(gp0["open"])),
             (lead1, follow1, float(gp1["close"]), float(gp1["open"]))]
-
-    cameras = DualCamera(wrist1_serial=args.wrist_serial1)   # env(head) + wrist(arm0) + wrist1(arm1)
     show_display = not args.no_display
     if show_display:
         cv2.namedWindow("Data Collection", cv2.WINDOW_AUTOSIZE)
@@ -750,6 +752,9 @@ def main():
     logger.info(f"follow 爪='{args.follow_gripper}' 开合范围 "
                 f"[{FOLLOW_GRIPPER_MIN:.4f}, {FOLLOW_GRIPPER_MAX:.4f}]")
 
+    # 相机先启动、臂后连接(理由同 run_dual: 相机 USB 重枚举可能瞬断 CAN, 不留臂闲置暴露窗口)
+    cameras = DualCamera()
+
     from airbot_py.arm import AIRBOTArm, RobotMode, SpeedProfile
 
     # 连接双臂
@@ -764,9 +769,6 @@ def main():
         lead.disconnect()
         raise RuntimeError(f"无法连接 Follow 臂 (port={FOLLOW_PORT})")
     logger.info("Follow 臂 (Play) 已连接")
-
-    # 连接相机
-    cameras = DualCamera()
 
     show_display = not args.no_display
     if show_display:

@@ -29,6 +29,9 @@ class Pi0Config(_model.BaseModelConfig):
     # token 拼进 prefix, 让模型按几何/功能区做动作、并支持跨夹爪混训。默认关(行为不变)。
     gripper_token: bool = False
     num_gripper_points: int = 512
+    # 区域化: 每爪按 tip/mid/rear 编成 3 个 token(共享 PointNet 逐区编码 + 零初始化区域嵌入)。
+    # 开启后点云输入形状变为 (b, 3, P, 3), num_gripper_points 语义 = 每区点数。
+    region_tokens: bool = False
 
     # Set the model specific defaults.
     action_dim: int = 32
@@ -89,7 +92,9 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
-                gripper_pc=(jax.ShapeDtypeStruct([batch_size, self.num_gripper_points, 3], jnp.float32)
+                gripper_pc=(jax.ShapeDtypeStruct(
+                    [batch_size, 3, self.num_gripper_points, 3] if self.region_tokens
+                    else [batch_size, self.num_gripper_points, 3], jnp.float32)
                             if self.gripper_token else None),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)

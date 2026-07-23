@@ -30,6 +30,7 @@ def augment_cloud(points, finger_id=None, rng=None, *,
                                             # -> GET 指尖相触(内距≈0)几乎不能闭, 平行爪可闭
                   scale_range=(0.95, 1.05), # 尺度抖动, 以 TCP 原点为中心
                   rot_deg=2.5,              # 微旋转上限(deg), 模拟标定误差
+                  labels=None,              # (N,) 逐点标签(如 region), dropout 时同步保留对应行
                   return_params=False):     # True 则同时返回这次实际用了哪些参数(给可视化标注)
     """(N,3) TCP-common 点云 -> 增强后 (M,3)。
 
@@ -37,6 +38,8 @@ def augment_cloud(points, finger_id=None, rng=None, *,
         shift>0 = 外移(更开); shift<0 = 内移(更闭, 自动 clamp 防两指穿过中线)。
         本就张开的(平行爪)可给 close_shift_max>0 允许闭合; 本就闭合的(GET)留 0 只开。
         非 0/1 的点(如 -1=link6/body)不动。
+    labels (N,): 给了就返回 (P, labels_kept[, params]) —— 几何变换不重排点序, 只有
+        dropout 改行数, 对标签应用同一 keep 掩码, 保证逐点对应(区域化 token 拆分用)。
     rng: np.random.Generator / int 种子 / None。
     """
     if rng is None:
@@ -78,13 +81,18 @@ def augment_cloud(points, finger_id=None, rng=None, *,
         P += rng.normal(0.0, jitter_std, P.shape)
 
     # 5) 随机 dropout(模拟遮挡; 随机, 不系统性丢某区域; 别丢太狠)
+    keep = None
     if dropout > 0:
-        keep = rng.random(len(P)) >= dropout
-        if keep.sum() >= max(8, int(0.3 * len(P))):
-            P = P[keep]
+        k = rng.random(len(P)) >= dropout
+        if k.sum() >= max(8, int(0.3 * len(P))):
+            P = P[k]; keep = k
 
     P = P.astype(np.float32)
+    out = [P]
+    if labels is not None:
+        lab = np.asarray(labels)
+        out.append(lab[keep] if keep is not None else lab)
     if return_params:
-        return P, {"scale": s, "rot_deg": a_deg.tolist(), "shift": shift,
-                   "jitter": jitter_std, "n": len(P), "n0": n0}
-    return P
+        out.append({"scale": s, "rot_deg": a_deg.tolist(), "shift": shift,
+                    "jitter": jitter_std, "n": len(P), "n0": n0})
+    return out[0] if len(out) == 1 else tuple(out)

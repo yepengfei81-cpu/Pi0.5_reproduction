@@ -109,6 +109,11 @@ class Pi0(_model.BaseModel):
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         if config.gripper_token:
             self.gripper_encoder = PointNetEncoder(paligemma_config.width, rngs=rngs)
+            if config.region_tokens:
+                # 区域嵌入(tip/mid/rear 身份), 零初始化: 起步时各 token 纯由该区几何决定,
+                # 区域身份信息随训练渐进学入(不破坏底座先验)。
+                self.gripper_region_emb = nnx.Param(
+                    jnp.zeros((3, paligemma_config.width), dtype=jnp.float32))
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -121,6 +126,16 @@ class Pi0(_model.BaseModel):
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
+
+    def _gripper_tokens(self, pc):
+        """夹爪点云 -> token(s)。(b,p,3) -> (b,1,e) 单全局 token;
+        区域模式 (b,3,p,3) -> (b,3,e): 共享 PointNet 逐区编码 + 零初始化区域嵌入。"""
+        if pc.ndim == 4:
+            b, r = pc.shape[0], pc.shape[1]
+            toks = self.gripper_encoder(einops.rearrange(pc, "b r p c -> (b r) p c"))  # ((b r),1,e)
+            toks = einops.rearrange(toks[:, 0, :], "(b r) e -> b r e", b=b, r=r)
+            return toks + self.gripper_region_emb.value[None, :, :]
+        return self.gripper_encoder(pc)
 
     @at.typecheck
     def embed_prefix(
@@ -153,15 +168,16 @@ class Pi0(_model.BaseModel):
             ar_mask += [False] * tokenized_inputs.shape[1]
 
         # 方案C: 夹爪几何 token(和图像/文本同档: 全注意力)。臂0(单臂=唯一)。
+        # 全局模式 1 token; 区域模式 3 token(tip/mid/rear)。
         if obs.gripper_pc is not None:
-            g_tok = self.gripper_encoder(obs.gripper_pc)          # (b, 1, emb)
+            g_tok = self._gripper_tokens(obs.gripper_pc)          # (b, 1|3, emb)
             tokens.append(g_tok)
             input_mask.append(jnp.ones((g_tok.shape[0], g_tok.shape[1]), dtype=jnp.bool_))
             ar_mask += [False] * g_tok.shape[1]
 
-        # 双臂: 臂1 夹爪 token(共用同一 PointNet)。mask=arm1_mask: 单臂样本(=0)屏蔽此 token。
+        # 双臂: 臂1 夹爪 token(共用同一 PointNet)。mask=arm1_mask: 单臂样本(=0)整组屏蔽。
         if obs.gripper_pc_1 is not None:
-            g_tok1 = self.gripper_encoder(obs.gripper_pc_1)       # (b, 1, emb)
+            g_tok1 = self._gripper_tokens(obs.gripper_pc_1)       # (b, 1|3, emb)
             tokens.append(g_tok1)
             if obs.arm1_mask is not None:
                 am = jnp.asarray(obs.arm1_mask).reshape((g_tok1.shape[0], -1))[:, 0] > 0.5   # (b,)
