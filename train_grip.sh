@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=train_dualarm
+#SBATCH --job-name=train_region
 #SBATCH --partition=gpu_h200
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -14,22 +14,24 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
 export HF_LEROBOT_HOME=/n/home08/yxma/ypf/pi_data
 cd ~/ypf/Pi0.5_reproduction
 
-CONFIG=pi05_cotrain_dualarm
-DATA="$HF_LEROBOT_HOME/cotrain_dualarm/meta/info.json"
-NORM="assets/$CONFIG/cotrain_dualarm/norm_stats.json"
+CONFIG=pi05_cotrain_dualarm_region
+DATA="$HF_LEROBOT_HOME/cotrain_dualarm2/meta/info.json"
+NORM="assets/$CONFIG/cotrain_dualarm2/norm_stats.json"
 
-echo ">>> 已分到卡 ($(date)); 等待数据 + norm_stats 就绪..."
+# GPUs are allocated at this point; wait until dataset + norm_stats are uploaded
+# (max 4 hours, then give up instead of holding the GPUs).
+echo ">>> GPUs allocated ($(date)); waiting for dataset + norm_stats..."
 WAITED=0
 until [ -f "$DATA" ] && [ -f "$NORM" ]; do
     sleep 60; WAITED=$((WAITED+1))
-    [ $WAITED -ge 240 ] && { echo "!!! 等待超4小时, 放弃"; exit 1; }
-    [ $((WAITED % 5)) -eq 0 ] && echo "  ...已等 ${WAITED} 分钟 (data:$([ -f "$DATA" ]&&echo ok||echo -) norm:$([ -f "$NORM" ]&&echo ok||echo -))"
+    [ $WAITED -ge 240 ] && { echo "!!! Waited over 4 hours, giving up"; exit 1; }
+    [ $((WAITED % 5)) -eq 0 ] && echo "  ... waited ${WAITED} min (data:$([ -f "$DATA" ]&&echo ok||echo -) norm:$([ -f "$NORM" ]&&echo ok||echo -))"
 done
-echo ">>> 就绪 ($(date)), 开始训练"
+echo ">>> Ready ($(date)), starting training"
 
 set -e
 uv run --no-sync scripts/train.py $CONFIG \
-  --exp-name=dualarm_v1 \
+  --exp-name=region_v1 \
   --overwrite \
   --save-interval=999999 \
   --keep-period=999999

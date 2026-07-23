@@ -1277,14 +1277,14 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        # batch48 + 33k步 ≈ batch32 + 50k步(同epoch); LR随batch按~1.4x线性缩放补偿更少的更新次数。
-        num_train_steps=33_000,
+        # batch48 + 34k步 ≈ batch32 + 50k步(同epoch); LR随batch按~1.4x线性缩放补偿更少的更新次数。
+        num_train_steps=34_000,
         batch_size=48,
         num_workers=8,  # 默认2太低; 16 会导致 worker spawn 的 pickle 截断, 8 稳且够喂 2xH200
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=3.5e-5,
-            decay_steps=33_000,
+            decay_steps=34_000,
             decay_lr=3.5e-6,
         ),
         freeze_filter=pi0_config.Pi0Config(
@@ -1318,13 +1318,13 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=33_000,
+        num_train_steps=34_000,
         batch_size=48,
         num_workers=8,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=3.5e-5,
-            decay_steps=33_000,
+            decay_steps=34_000,
             decay_lr=3.5e-6,
         ),
         freeze_filter=pi0_config.Pi0Config(
