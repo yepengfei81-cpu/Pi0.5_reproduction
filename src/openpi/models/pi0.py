@@ -114,6 +114,20 @@ class Pi0(_model.BaseModel):
                 # 区域身份信息随训练渐进学入(不破坏底座先验)。
                 self.gripper_region_emb = nnx.Param(
                     jnp.zeros((3, paligemma_config.width), dtype=jnp.float32))
+        self.film_geometry = bool(config.gripper_token and config.film_geometry)
+        if self.film_geometry:
+            assert config.pi05, "film_geometry 依赖 adaRMS cond, 仅 pi05 可用"
+            # FiLM 几何注入(方案B): 每臂区域特征拼接 -> 零初始化投影 -> 加进 adaRMS cond。
+            # 零初始化(kernel+bias 全零) => 起步严格等价于纯时间步 cond, 调制渐进生效。
+            # 逐臂独立投影(不求和共享)保留"臂0=GET/臂1=parallel"与对调的可区分性。
+            # 命名含 gripper: 权重加载白名单(.*(lora|gripper).*)与可训练性(不含 llm)自动正确。
+            n_reg = 3 if config.region_tokens else 1
+            self.gripper_film_proj = nnx.Linear(
+                n_reg * paligemma_config.width, action_expert_config.width,
+                kernel_init=nnx.initializers.zeros_init(), rngs=rngs)
+            self.gripper_film_proj_1 = nnx.Linear(
+                n_reg * paligemma_config.width, action_expert_config.width,
+                kernel_init=nnx.initializers.zeros_init(), rngs=rngs)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -136,6 +150,24 @@ class Pi0(_model.BaseModel):
             toks = einops.rearrange(toks[:, 0, :], "(b r) e -> b r e", b=b, r=r)
             return toks + self.gripper_region_emb.value[None, :, :]
         return self.gripper_encoder(pc)
+
+    def _film_cond(self, obs: _model.Observation):
+        """FiLM 几何 cond: 每臂区域特征(共享 PointNet)拼接 -> 零初始化逐臂投影, 相加。
+        与 prefix token 注入互补——那条路可被注意力无视, 这条直达动作专家每层 adaRMS。
+        臂1 按 arm1_mask 屏蔽(单臂样本臂1贡献=0)。返回 (b, expert_width)。"""
+
+        def flat(pc):
+            f = self._gripper_tokens(pc)                        # (b, 1|3, e)
+            return einops.rearrange(f, "b r e -> b (r e)")
+
+        cond = self.gripper_film_proj(flat(obs.gripper_pc))
+        if obs.gripper_pc_1 is not None:
+            c1 = self.gripper_film_proj_1(flat(obs.gripper_pc_1))
+            if obs.arm1_mask is not None:
+                am = jnp.asarray(obs.arm1_mask).reshape((c1.shape[0], -1))[:, :1]
+                c1 = c1 * (am > 0.5).astype(c1.dtype)
+            cond = cond + c1
+        return cond
 
     @at.typecheck
     def embed_prefix(
@@ -223,6 +255,8 @@ class Pi0(_model.BaseModel):
             time_emb = nnx.swish(time_emb)
             action_expert_tokens = action_tokens
             adarms_cond = time_emb
+            if self.film_geometry and obs.gripper_pc is not None:
+                adarms_cond = adarms_cond + self._film_cond(obs)
         else:
             # mix timestep + action information using an MLP (no adaRMS)
             time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)

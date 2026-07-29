@@ -164,21 +164,36 @@ class EEFRunner:
         print(f">>> [2/4] 模型加载完成 (模型={'20D双臂' if self.model_dual else '10D单臂'}, "
               f"驱动={'双臂' if a.dual_arm else '仅臂0'})", flush=True)
 
-        # 夹爪几何 token: 统一从 grippers.npz 按爪名取(与训练同源), 子采样到 num_gripper_points
+        # 夹爪几何 token: 统一从 grippers.npz 按爪名取(与训练同源)。
+        # 全局模式 -> (P,3) 1 token; 区域化模型(region_tokens) -> (3,P,3) tip/mid/rear 各 P 点。
+        # 部署一律喂未增强的规范点云(与训练时 obs 直喂分支一致)。
         cloud0 = cloud1 = None
         if getattr(self.cfg.model, "gripper_token", False):
             z = np.load(a.grippers_npz, allow_pickle=True)
             P = int(getattr(self.cfg.model, "num_gripper_points", 512))
+            region = bool(getattr(self.cfg.model, "region_tokens", False))
             rng = np.random.default_rng(0)
 
             def _pick(name):
                 pc = np.asarray(z[f"{name}_points"], np.float32)
+                if region:
+                    reg = np.asarray(z[f"{name}_region"])
+                    return np.stack([
+                        pc[rng.choice(np.flatnonzero(reg == r), P,
+                                      replace=int((reg == r).sum()) < P)]
+                        for r in range(3)])                       # (3, P, 3)
                 idx = rng.choice(len(pc), P, replace=len(pc) < P)
                 return pc[idx]
-            cloud0 = _pick(a.arm0_gripper)
-            cloud1 = _pick(a.arm1_gripper) if self.model_dual else None
-            print(f">>> 夹爪 token: 臂0={a.arm0_gripper}{cloud0.shape}"
-                  + (f" 臂1={a.arm1_gripper}{cloud1.shape}" if cloud1 is not None else ""), flush=True)
+            # token-swap 诊断: --arm0/1-cloud 只换喂模型的点云, TCP/开合标定仍按实际装的爪
+            name0 = a.arm0_cloud or a.arm0_gripper
+            name1 = a.arm1_cloud or a.arm1_gripper
+            cloud0 = _pick(name0)
+            cloud1 = _pick(name1) if self.model_dual else None
+            swap0 = f" ⚠SWAP(实装{a.arm0_gripper})" if name0 != a.arm0_gripper else ""
+            swap1 = f" ⚠SWAP(实装{a.arm1_gripper})" if name1 != a.arm1_gripper else ""
+            print(f">>> 夹爪 token{'(区域化 3tok/爪)' if region else ''}: "
+                  f"臂0={name0}{cloud0.shape}{swap0}"
+                  + (f" 臂1={name1}{cloud1.shape}{swap1}" if cloud1 is not None else ""), flush=True)
         else:
             print(">>> ⚠ 当前 config 未开 gripper_token, 不注入点云", flush=True)
 
@@ -465,6 +480,10 @@ def main():
     ap.add_argument("--arm0-gripper", default="parallel",
                     help="臂0(右)实际装的爪 parallel/get; 决定点云 token+开合范围+TCP偏移")
     ap.add_argument("--arm1-gripper", default="parallel", help="臂1(左)实际装的爪")
+    ap.add_argument("--arm0-cloud", default=None,
+                    help="token-swap 诊断: 只换臂0喂模型的爪点云(运动学标定仍用 --arm0-gripper); "
+                         "如实装 parallel 时传 get。默认=同 --arm0-gripper")
+    ap.add_argument("--arm1-cloud", default=None, help="同上, 覆盖臂1点云")
     ap.add_argument("--grippers-npz", default=str(_ROOT / "gripper_geom" / "grippers.npz"),
                     help="多爪点云库, 按爪名取(与训练同源)")
     # 相机

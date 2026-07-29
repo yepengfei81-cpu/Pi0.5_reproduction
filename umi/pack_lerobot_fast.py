@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """pack v2: 零转码 + 增量打包(遥操作/双臂 -> 双臂 20D 统一 LeRobot 数据集)。
 
-与 pack_lerobot.py 的区别(为什么快 ~20x):
+与旧 pack_lerobot.py 的区别(为什么快 ~20x):
   - 视频【字节级复制】源 mp4(源与目标编码参数完全一致: h264/640x480/yuv420p/10fps),
     不再"解码->重编码"。画质=采集原始一代压缩, 严格优于旧脚本的二代压缩。
-  - 状态转换复用 pack_lerobot 的同一套数学(_arm_state_action/REST10), 逐元素一致。
+  - 状态转换数学(_arm_state_action/build_wprime/REST10 等)从旧脚本【逐字内联】进本文件
+    (见下方"内联数学"段), 与旧打包逐元素一致; 本脚本已自包含, 不再 import pack_lerobot。
   - manifest 增量: pack_manifest.json 记录每条源 episode 的打包去向, --append 只处理新增。
   - 单臂样本的 wrist_image_1 黑视频用 ffmpeg lavfi 生成(按长度缓存复用), 不逐帧编码。
 
-限制: 只支持双臂 20D schema(现行主线); UMI/单臂10D 旧格式请继续用 pack_lerobot.py。
+限制: 只支持双臂 20D schema(现行主线); UMI mcap/单臂10D 旧格式才需要旧 pack_lerobot.py
+(旧脚本待消融实验验证后删除)。
 
 用法:
   # 全量(格式模板默认取现有打包集 cotrain_dualarm2 的 schema)
@@ -28,18 +30,144 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent))
-from pack_lerobot import (  # noqa: E402  复用同一套数学/工具, 保证与旧打包逐元素一致
-    REST10, _arm_state_action, load_source_tasks, verify_dataset,
-    make_server_compatible, OUT_W, OUT_H, TARGET_FPS,
-)
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gripper_geom"))
 from gripper_params import get_params  # noqa: E402
 
+OUT_W, OUT_H = 640, 480
+TARGET_FPS = 10                  # 统一帧率(遥操作 10Hz)
 CHUNK = 1000                     # LeRobot chunks_size(与模板一致)
 VIDEO_KEYS = ("image", "wrist_image", "wrist_image_1")
 N_IMG_STAT_FRAMES = 10           # 图像 stats 采样帧数(仅元数据, 训练不使用图像stats)
+
+
+# ---------------------------------------------------------------------------
+# 内联数学(逐字拷自 pack_lerobot.py / umi_to_lerobot.py, 保证与旧打包逐元素一致;
+# 若需改动, 只改这里——旧脚本已冻结不再维护)
+# ---------------------------------------------------------------------------
+def quat_to_rot(x, y, z, w) -> np.ndarray:
+    n = (x * x + y * y + z * z + w * w) ** 0.5
+    if n == 0:
+        return np.eye(3)
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w),     2 * (x * z + y * w)],
+        [2 * (x * y + z * w),     1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x * x + y * y)],
+    ])
+
+
+def rot_to_6d(R: np.ndarray) -> np.ndarray:
+    """旋转矩阵 -> 6D 表示（前两列，连续无奇异，适合网络学习）。"""
+    return np.concatenate([R[:, 0], R[:, 1]])
+
+
+def build_wprime(tip_pos, R_tool):
+    """tip_pos (N,3), R_tool (N,3,3) 在重力对齐(z向上)的参考系里
+    -> W'(原点=首帧指尖, z=重力, 首帧 yaw 归零) 下的 pos(N,3)+rot6d(N,6)。"""
+    fwd0 = R_tool[0][:, 0]                       # 工具前向(x)在参考系的方向
+    yaw0 = np.arctan2(fwd0[1], fwd0[0])
+    c, s = np.cos(yaw0), np.sin(yaw0)
+    Rw = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1.0]])   # ref <- W'
+    t0 = tip_pos[0]
+    pos = (tip_pos - t0) @ Rw                    # = Rw^T (p - t0)
+    R_loc = np.einsum("ji,njk->nik", Rw, R_tool)
+    rot6d = np.stack([rot_to_6d(R) for R in R_loc])
+    return pos.astype(np.float32), rot6d.astype(np.float32)
+
+
+def make_state_action(pos, rot6d, grip01):
+    """组装 state(N,10) 和 actions(N,10)=下一帧 state。"""
+    state = np.concatenate([pos, rot6d, grip01[:, None]], axis=1).astype(np.float32)
+    action = np.roll(state, -1, axis=0)
+    action[-1] = state[-1]                       # 末帧无下一帧，重复
+    return state, action
+
+
+# 单臂 10D 的"静止/rest"值: pos=0 + 单位旋转 rot6d[1,0,0,0,1,0] + grip=0。
+# 单臂样本的臂1 用它填充并 arm1_mask=0(loss/相机/token 都会屏蔽), 只是占位。
+REST10 = np.array([0, 0, 0, 1, 0, 0, 0, 1, 0, 0], np.float32)
+
+
+def _arm_state_action(se_arm, ae_arm, gclose, gopen, tcp_offset):
+    """单条臂的 (N,8)=pos3+quat4(xyzw)+grip -> 10D state/actions(W' 系, 该爪归一化)。
+    含关键修正: 动作夹爪改用 lead(遥操作指令)夹爪——follow(实际)抓取时只能闭到物体
+    宽度、表达不出"夹紧力", 模型学了就会"贴着物体宽度但不夹住"。"""
+    se = np.asarray(se_arm, np.float64)
+    R_tool = np.stack([quat_to_rot(*q) for q in se[:, 3:7]])
+    off = np.asarray(tcp_offset, float)
+    pos_tip = se[:, :3] + np.einsum("nij,j->ni", R_tool, off)
+    span = (gopen - gclose) or 1.0
+    pos, rot6d = build_wprime(pos_tip, R_tool)
+    grip_state = np.clip((se[:, 7] - gclose) / span, 0.0, 1.0).astype(np.float32)
+    state, action = make_state_action(pos, rot6d, grip_state)
+    if ae_arm is not None:                                   # 动作夹爪用 lead(指令)夹爪
+        ae = np.asarray(ae_arm, np.float64)
+        grip_lead = np.clip((ae[:, 7] - gclose) / span, 0.0, 1.0).astype(np.float32)
+        m = min(len(action), len(grip_lead)); action[:m, 9] = grip_lead[:m]
+    return state, action
+
+
+def load_source_tasks(troot):
+    """读遥操作源数据集的 meta/tasks.jsonl -> {task_index: task串}。"""
+    tasks = {}
+    f = troot / "meta" / "tasks.jsonl"
+    if f.exists():
+        for line in f.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                d = json.loads(line); tasks[int(d["task_index"])] = d["task"]
+    return tasks
+
+
+def make_server_compatible(out_dir):
+    """把本地 datasets>=4.0 写的特征类型 'List' 降级为 'Sequence'，
+    让服务器(datasets 3.x / lerobot 0.1.0)能直接读。打包末尾自动调用。
+    只改 schema 元数据，不动数据。"""
+    import pyarrow.parquet as pq
+    n = 0
+    for pf in sorted((out_dir / "data").rglob("*.parquet")):
+        t = pq.read_table(pf)
+        md = dict(t.schema.metadata or {})
+        ch = False
+        for k, v in list(md.items()):
+            if b'"List"' in v:
+                md[k] = v.replace(b'"List"', b'"Sequence"'); ch = True
+        if ch:
+            pq.write_table(t.replace_schema_metadata(md), pf); n += 1
+    info = out_dir / "meta" / "info.json"
+    if info.exists():
+        s = info.read_text(encoding="utf-8")
+        if '"List"' in s:
+            info.write_text(s.replace('"List"', '"Sequence"'), encoding="utf-8")
+    if n:
+        print(f"  ✓ 兼容处理: {n} 个 parquet 特征类型 List->Sequence (服务器 datasets 3.x 可读)")
+
+
+def verify_dataset(out_dir, repo_id):
+    print("\n===== 抽检（重载）=====")
+    import pyarrow.parquet as pq
+    pqs = sorted((out_dir / "data").rglob("episode_*.parquet"))
+    mp4s = sorted((out_dir / "videos").rglob("*.mp4"))
+    print(f"  parquet: {len(pqs)}  视频: {len(mp4s)}")
+    t = pq.read_table(pqs[0]).to_pydict()
+    st = np.array(t["state"]); ac = np.array(t["actions"]); em = np.array(t["env_mask"])
+    print(f"  state shape={st.shape}  actions shape={ac.shape}  env_mask[0]={em[0]}")
+    if st.shape[1] >= 20:                     # 双臂 20D
+        a1 = np.array(t.get("arm1_mask", [[0]]))
+        g0 = np.array(t.get("gripper_id_0", [[-1]])); g1 = np.array(t.get("gripper_id_1", [[-1]]))
+        print(f"  arm1_mask[0]={a1[0]}  gripper_id_0[0]={g0[0]}  gripper_id_1[0]={g1[0]}")
+        print(f"  臂0 state[0]={np.round(st[0][:10],3).tolist()}")
+        print(f"  臂1 state[0]={np.round(st[0][10:],3).tolist()}  (单臂应=rest[0,0,0,1,0,0,0,1,0,0])")
+    else:                                     # 单臂 10D
+        gid = np.array(t.get("gripper_id", [[-1]]))
+        print(f"  gripper_id[0]={gid[0]}  state[0]={np.round(st[0],3).tolist()}")
+    # 解码一帧确认视频可读
+    for sub in ("wrist_image", "image"):
+        v = sorted((out_dir / "videos").rglob(f"{sub}/*.mp4"))
+        if v:
+            cap = cv2.VideoCapture(str(v[0])); ok, fr = cap.read(); cap.release()
+            print(f"  {sub}: {'可解码' if ok else '✗解码失败'} "
+                  f"{fr.shape if ok else ''}")
+    print("  ✓ 抽检完成")
 
 
 # ---------------------------------------------------------------------------

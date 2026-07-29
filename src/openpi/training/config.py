@@ -1268,7 +1268,7 @@ _CONFIGS = [
             num_gripper_points=512,
         ),
         data=LeRobotAirbotEEFDataConfig(
-            repo_id="cotrain_dualarm",
+            repo_id="cotrain_dualarm3",   # 消融梯 b 档: 全局 token, 数据与 region/film 档严格一致
             grippers_npz_path="gripper_geom/grippers.npz",
             gripper_names=("parallel", "get"),
             num_gripper_points=512,
@@ -1294,8 +1294,15 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
+    # ------------------------------------------------------------------
+    # 消融梯(4 档, 同数据 cotrain_dualarm3 = 550条: 400单臂含两爪挂杯 + 150双臂切泥):
+    #   a) _vanilla: 无 token/无点云增强(等价原版 openpi + 我们的数据接口)
+    #   b) pi05_cotrain_dualarm: 全局 1 token/爪
+    #   c) _region: tip/mid/rear 3 token/爪
+    #   d) _film:   region + FiLM 几何注入(方案B, 修复 token 被注意力无视的问题)
+    # 除模型开关外全部超参一致; 各 config 的 norm_stats 需各自计算(或复制同数据的)。
+    # ------------------------------------------------------------------
     # 区域化几何 token: 每爪 tip/mid/rear 3 token(共享 PointNet + 零初始化区域嵌入)。
-    # 数据 = cotrain_dualarm2(300单臂 + 100旧握法regrasp + 50新握法); 其余超参同 pi05_cotrain_dualarm。
     TrainConfig(
         name="pi05_cotrain_dualarm_region",
         model=pi0_config.Pi0Config(
@@ -1308,7 +1315,81 @@ _CONFIGS = [
             region_tokens=True,
         ),
         data=LeRobotAirbotEEFDataConfig(
-            repo_id="cotrain_dualarm2",
+            repo_id="cotrain_dualarm3",
+            grippers_npz_path="gripper_geom/grippers.npz",
+            gripper_names=("parallel", "get"),
+            num_gripper_points=256,
+            gripper_aug=True,
+            dual=True,
+            region_tokens=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=34_000,
+        batch_size=48,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=3.5e-5,
+            decay_steps=34_000,
+            decay_lr=3.5e-6,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # 消融梯 a 档: 无 token/无点云/无增强 = 原版 openpi + 我们的数据接口(20D/W'/双臂 schema)。
+    # 保留 per-gripper 归一化与 TCP 指尖锚定(在打包数据里, 属"接口"而非"方法", 且匿名化爪身份)。
+    TrainConfig(
+        name="pi05_cotrain_dualarm_vanilla",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotAirbotEEFDataConfig(
+            repo_id="cotrain_dualarm3",
+            dual=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=34_000,
+        batch_size=48,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=3.5e-5,
+            decay_steps=34_000,
+            decay_lr=3.5e-6,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # 消融梯 d 档: region + FiLM 几何注入(方案B)。动机: probe_token_swap 实测 region_v1
+    # 对 swap/全零/随机点云均 ≈1.0x 噪声地板(prefix token 被注意力整体无视); FiLM 把几何
+    # 加进动作专家每层 adaRMS cond, 不经注意力竞争。验收: 新 checkpoint 重跑探针, swap 倍数应>1。
+    TrainConfig(
+        name="pi05_cotrain_dualarm_film",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            gripper_token=True,
+            num_gripper_points=256,
+            region_tokens=True,
+            film_geometry=True,
+        ),
+        data=LeRobotAirbotEEFDataConfig(
+            repo_id="cotrain_dualarm3",
             grippers_npz_path="gripper_geom/grippers.npz",
             gripper_names=("parallel", "get"),
             num_gripper_points=256,

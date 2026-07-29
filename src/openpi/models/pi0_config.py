@@ -32,6 +32,11 @@ class Pi0Config(_model.BaseModelConfig):
     # 区域化: 每爪按 tip/mid/rear 编成 3 个 token(共享 PointNet 逐区编码 + 零初始化区域嵌入)。
     # 开启后点云输入形状变为 (b, 3, P, 3), num_gripper_points 语义 = 每区点数。
     region_tokens: bool = False
+    # FiLM 几何注入(方案B): 区域特征拼接 -> 零初始化逐臂投影 -> 加进动作专家 adaRMS cond
+    # (与流匹配时间步同一条通道)。动机: prefix token 注入可被注意力整体无视
+    # (probe_token_swap 实测 swap/全零/随机点云均 ≈1.0x 噪声地板), FiLM 直达每层、
+    # 不经注意力竞争。需要 gripper_token=True 且 pi05=True(adaRMS 仅 pi05 有)。
+    film_geometry: bool = False
 
     # Set the model specific defaults.
     action_dim: int = 32

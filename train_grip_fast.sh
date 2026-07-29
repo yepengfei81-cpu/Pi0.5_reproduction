@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=train_region_rq
+#SBATCH --job-name=train_film_rq
 #SBATCH --partition=gpu_requeue
 #SBATCH --requeue
 #SBATCH --open-mode=append
@@ -17,10 +17,10 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
 export HF_LEROBOT_HOME=/n/home08/yxma/ypf/pi_data
 cd ~/ypf/Pi0.5_reproduction
 
-CONFIG=pi05_cotrain_dualarm_region
-DATA="$HF_LEROBOT_HOME/cotrain_dualarm2/meta/info.json"
-NORM="assets/$CONFIG/cotrain_dualarm2/norm_stats.json"
-CKPT_DIR="checkpoints/$CONFIG/region_v1"
+CONFIG=pi05_cotrain_dualarm_film
+DATA="$HF_LEROBOT_HOME/cotrain_dualarm3/meta/info.json"
+NORM="assets/$CONFIG/cotrain_dualarm3/norm_stats.json"
+CKPT_DIR="checkpoints/$CONFIG/film_v1"
 
 # Wait for dataset + norm_stats (max 4 hours, then give up instead of holding GPUs).
 echo ">>> GPUs allocated ($(date)); waiting for dataset + norm_stats..."
@@ -45,6 +45,6 @@ fi
 
 set -e
 uv run --no-sync scripts/train.py $CONFIG \
-  --exp-name=region_v1 $MODE \
+  --exp-name=film_v1 $MODE \
   --save-interval=5000 \
   --keep-period=10000
