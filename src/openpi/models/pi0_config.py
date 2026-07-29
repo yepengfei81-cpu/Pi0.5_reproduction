@@ -37,6 +37,11 @@ class Pi0Config(_model.BaseModelConfig):
     # (probe_token_swap 实测 swap/全零/随机点云均 ≈1.0x 噪声地板), FiLM 直达每层、
     # 不经注意力竞争。需要 gripper_token=True 且 pi05=True(adaRMS 仅 pi05 有)。
     film_geometry: bool = False
+    # 互斥相机遮断(仅训练): (p_wrist, p_env)。u<p_w 丢全部腕相机(env保留),
+    # p_w<=u<p_w+p_e 只丢env——【永不全丢】, 每个样本至少一路视觉。
+    # 动机: 爪身份可从腕相机读出(视觉冗余), 几何通道(token/FiLM)拿不到梯度压力
+    # (film_v1 实测被主动收缩); 丢腕样本里身份只剩点云一条路。部署不受影响。
+    cam_dropout: tuple[float, float] = (0.0, 0.0)
 
     # Set the model specific defaults.
     action_dim: int = 32

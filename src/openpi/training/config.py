@@ -1373,6 +1373,50 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
+    # 消融梯 e 档: film + 互斥相机遮断。film_v1 判决: 结构注入也被主动收缩
+    # (gripper_param_norm 镜像下压 + 纵向探针 1.3x->1.1x 衰减)——瓶颈是视觉冗余
+    # 下没有梯度压力, 不是注入路。遮断(30%丢腕/15%丢env/永不全丢)让丢腕样本里
+    # 爪身份只剩点云一条路。验收: wandb probe/roll_ratio 持续明显>1, 离线探针挂杯 swap>1。
+    TrainConfig(
+        name="pi05_cotrain_dualarm_film_drop",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            gripper_token=True,
+            num_gripper_points=256,
+            region_tokens=True,
+            film_geometry=True,
+            cam_dropout=(0.30, 0.15),
+        ),
+        data=LeRobotAirbotEEFDataConfig(
+            repo_id="cotrain_dualarm3",
+            grippers_npz_path="gripper_geom/grippers.npz",
+            gripper_names=("parallel", "get"),
+            num_gripper_points=256,
+            gripper_aug=True,
+            dual=True,
+            region_tokens=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=34_000,
+        batch_size=48,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=3.5e-5,
+            decay_steps=34_000,
+            decay_lr=3.5e-6,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
     # 消融梯 d 档: region + FiLM 几何注入(方案B)。动机: probe_token_swap 实测 region_v1
     # 对 swap/全零/随机点云均 ≈1.0x 噪声地板(prefix token 被注意力整体无视); FiLM 把几何
     # 加进动作专家每层 adaRMS cond, 不经注意力竞争。验收: 新 checkpoint 重跑探针, swap 倍数应>1。

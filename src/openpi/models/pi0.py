@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 
 import einops
@@ -80,6 +81,23 @@ class PointNetEncoder(nnx.Module):
         return tok[:, None, :]             # (b,1,emb) 一个 token
 
 
+def _drop_cameras(rng, obs, probs):
+    """互斥相机遮断(训练期): u<p_w 丢所有腕相机, p_w<=u<p_w+p_e 只丢 env——永不全丢。
+    丢 = 图像置零 + image_mask 置 False(token 层被注意力屏蔽)。目的: 打破"爪身份
+    可从腕相机读出"的视觉冗余, 给几何通道(点云 token/FiLM)制造真实梯度压力。"""
+    p_w, p_e = probs
+    u = jax.random.uniform(rng, (obs.state.shape[0],))
+    drop_wrist = u < p_w
+    drop_env = (u >= p_w) & (u < p_w + p_e)
+    images = dict(obs.images)
+    masks = dict(obs.image_masks)
+    for k in images:
+        d = drop_wrist if "wrist" in k else drop_env
+        images[k] = jnp.where(d[:, None, None, None], jnp.zeros_like(images[k]), images[k])
+        masks[k] = masks[k] & ~d
+    return dataclasses.replace(obs, images=images, image_masks=masks)
+
+
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
@@ -128,6 +146,8 @@ class Pi0(_model.BaseModel):
             self.gripper_film_proj_1 = nnx.Linear(
                 n_reg * paligemma_config.width, action_expert_config.width,
                 kernel_init=nnx.initializers.zeros_init(), rngs=rngs)
+        assert sum(config.cam_dropout) <= 1.0, "cam_dropout 两概率之和须<=1(互斥分段)"
+        self.cam_dropout = tuple(config.cam_dropout)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -279,8 +299,10 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        preprocess_rng, drop_rng, noise_rng, time_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        if train and sum(self.cam_dropout) > 0:
+            observation = _drop_cameras(drop_rng, observation, self.cam_dropout)
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)

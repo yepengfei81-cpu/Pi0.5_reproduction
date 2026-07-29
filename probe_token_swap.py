@@ -38,6 +38,10 @@ SOURCES = [
     ("/home/ypf/pi_data/GET/pick_block_task/get_block", "get"),
     ("/home/ypf/pi_data/parallel/pick_block_task/airbot_block_data", "parallel"),
     ("/home/ypf/pi_data/GET/cut_dough_task/cut_dough_get_v2", ("get", "parallel")),
+    # 挂杯: 两爪同任务、示教行为真不同(parallel 滑移补偿) -> swap 在两个学过的模式间
+    # 切换, 是最锋利的判决切片。仅对含挂杯数据训的 checkpoint(film_v1 起)有意义。
+    ("/home/ypf/pi_data/GET/mug_tree_task/get_mug_tree", "get"),
+    ("/home/ypf/pi_data/parallel/mug_tree_task/parallel_mug_tree", "parallel"),
 ]
 FRAME_FRACS = (0.15, 0.3, 0.5, 0.7, 0.85)   # 每条 episode 抽帧位置
 OTHER = {"get": "parallel", "parallel": "get"}
@@ -187,7 +191,9 @@ def main():
     conds = [("A1 vs A2 (噪声地板)", "A2"), ("swap 另一把爪", "B"),
              ("全零点云", "Z"), ("随机点云", "R")]
     print("\n===== 输出敏感度(动作 chunk 平均绝对差, 及其相对噪声地板的倍数) =====")
-    for scope, keep in [("全部帧", None), ("仅切泥(任务与get点云训练绑定)", "cut_dough")]:
+    for scope, keep in [("全部帧", None), ("仅切泥(任务与get点云训练绑定)", "cut_dough"),
+                        ("仅挂杯(两爪同任务不同行为)", "mug_tree"),
+                        ("仅积木(两爪行为几乎相同, 预期≈1x)", "block")]:
         sel = [r for r in rows if keep is None or keep in r[0]]
         if not sel:
             continue

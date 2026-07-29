@@ -193,8 +193,50 @@ def train_step(
         "param_norm": optax.global_norm(kernel_params),
         "gripper_grad_norm": optax.global_norm(grads.filter(gripper_filter)),
         "gripper_param_norm": optax.global_norm(nnx.state(model, nnx.All(nnx.Param, gripper_filter))),
+        # FiLM 投影单独监控: 从0涨并保持=通道被使用; 回落向0=在被关闭。无 film 配置=0。
+        "gripper_film_norm": optax.global_norm(
+            nnx.state(model, nnx.All(nnx.Param, nnx_utils.PathRegex(".*film.*")))),
     }
     return new_state, info
+
+
+PROBE_INTERVAL = 2000  # 每N步跑一次训练中 swap 探针(4次采样, 开销≈几个train step, 可忽略)
+
+
+def probe_step(
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> dict[str, at.Array]:
+    """训练中夹爪点云敏感度探针(probe_token_swap 的在线版, 同噪声配对——
+    固定同一噪声, 输出差异纯来自点云, 噪声地板被精确扣除)。
+    看法: probe/roll_ratio(batch内滚动点云≈跨爪swap) 与 probe/zero_ratio(全零点云)
+    持续明显>1 = 几何通道活着; 贴着1 = 被无视(film_v1 的病)。"""
+    model = nnx.merge(state.model_def, state.params)
+    model.eval()
+    obs, _ = batch
+
+    def swap_pc(fn):
+        return dataclasses.replace(
+            obs, gripper_pc=fn(obs.gripper_pc),
+            gripper_pc_1=None if obs.gripper_pc_1 is None else fn(obs.gripper_pc_1))
+
+    fixed = jax.random.key(0)
+    a = model.sample_actions(fixed, obs)
+    a_alt = model.sample_actions(jax.random.key(1), obs)                      # 噪声地板
+    a_zero = model.sample_actions(fixed, swap_pc(jnp.zeros_like))
+    a_roll = model.sample_actions(fixed, swap_pc(lambda x: jnp.roll(x, 1, axis=0)))
+
+    def d(x, y):
+        return jnp.mean(jnp.abs(x - y))
+
+    floor = d(a, a_alt)
+    return {
+        "probe/noise_floor": floor,
+        "probe/zero_dact": d(a, a_zero),
+        "probe/roll_dact": d(a, a_roll),
+        "probe/zero_ratio": d(a, a_zero) / (floor + 1e-9),
+        "probe/roll_ratio": d(a, a_roll) / (floor + 1e-9),
+    }
 
 
 def main(config: _config.TrainConfig):
@@ -252,6 +294,14 @@ def main(config: _config.TrainConfig):
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
     )
+    # 训练中点云敏感度探针(仅 gripper_token 配置; 首次调用多花一次编译)
+    pprobe_step = None
+    if batch[0].gripper_pc is not None:
+        pprobe_step = jax.jit(
+            probe_step,
+            in_shardings=(train_state_sharding, data_sharding),
+            out_shardings=replicated_sharding,
+        )
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -273,6 +323,13 @@ def main(config: _config.TrainConfig):
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
+        if pprobe_step is not None and step % PROBE_INTERVAL == 0:
+            with sharding.set_mesh(mesh):
+                probe_info = jax.device_get(pprobe_step(train_state, batch))
+            pbar.write(f"Step {step}: probe roll={probe_info['probe/roll_ratio']:.2f}x "
+                       f"zero={probe_info['probe/zero_ratio']:.2f}x "
+                       f"(floor={probe_info['probe/noise_floor']:.4f})")
+            wandb.log(probe_info, step=step)
         batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
