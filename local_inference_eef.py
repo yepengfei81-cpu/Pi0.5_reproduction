@@ -14,16 +14,14 @@ W' 系: 每条臂在开局位姿各建一个 W'(原点=指尖, yaw 归零), 模�
 ——与采集时的对齐一致, 保证 IK 关节分支与示教相同(防撞限位)。单/双臂都支持。
 
 用法示例:
-  # 旧 10D 权重 + 单臂 + 从 lead 姿态开始
-  python local_inference_eef.py --checkpoint <ckpt10d> --config-name pi05_cotrain_eef_grip_aug \
-      --task "stack the bricks into a pyramid" --arm0-gripper parallel --start-from-lead
   # 20D 权重跑单臂任务(臂1 自动 rest)
-  python local_inference_eef.py --checkpoint <ckpt20d> --config-name pi05_cotrain_dualarm \
+  python local_inference_eef.py --checkpoint <ckpt20d> --config-name pi05_cotrain_dualarm_film \
       --task "stack the bricks into a pyramid" --arm0-gripper parallel --start-from-lead
   # 20D 双臂(切橡皮泥)
-  python local_inference_eef.py --checkpoint <ckpt20d> --config-name pi05_cotrain_dualarm \
+  python local_inference_eef.py --checkpoint <ckpt20d> --config-name pi05_cotrain_dualarm_film \
       --task "cut the play-dough with the knife" --dual-arm \
       --arm0-gripper get --arm1-gripper parallel --start-from-lead
+  # (旧 10D 单臂配置已从 config.py 删除, 要部署老 10D checkpoint 需从 git 历史找回配置)
   # 擦黑板(接触任务): 加 --env-mask 0 --board-z-auto
 
 先 --dry-run(只推理+打印, 不动)验证坐标链。急停: q / Esc(有窗口)或终端输入 q。

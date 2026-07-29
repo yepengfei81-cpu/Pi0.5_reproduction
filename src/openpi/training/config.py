@@ -1085,222 +1085,14 @@ _CONFIGS = [
     #
     # Fine-tuning AirBot Play configs.
     #
-    TrainConfig(
-        name="pi05_airbot_play",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=10,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotAirbotPlayDataConfig(
-            repo_id="airbot_play_data",
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=30_000,
-        batch_size=32,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        # LoRA 不需要 EMA
-        ema_decay=None,
-    ),
-    #
-    # UMI + 遥操作 联合训练 (任务空间 EEF 10D)
-    #
-    TrainConfig(
-        name="pi05_cotrain_eef",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=10,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotAirbotEEFDataConfig(
-            repo_id="cotrain_eef",
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=30_000,
-        batch_size=32,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-    ),
-    #
-    # 测试③：只用遥操作的 EEF（隔离“EEF 表示 vs 协同稀释”）。与 pi05_cotrain_eef
-    # 完全相同，仅 repo_id 换成 teleop_eef（无 UMI、头部相机全程有效）。
-    #
-    TrainConfig(
-        name="pi05_teleop_eef",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=10,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotAirbotEEFDataConfig(
-            repo_id="teleop_eef",
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=30_000,
-        batch_size=32,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-    ),
-    #
-    # 方案C 回归测试：同 teleop_eef(纯遥操作)但开 gripper_token(单把爪=常量描述符)。
-    # 用来验证"加了夹爪 token 的网络"在纯遥操作金标准上不掉点; 不掉点再混 GET。
-    # 注意: gripper_geom/parallel.npy 被 gitignore, 服务器上要自行放到该路径。
-    #
-    TrainConfig(
-        name="pi05_teleop_eef_grip",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=10,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-            gripper_token=True,
-            num_gripper_points=512,
-        ),
-        data=LeRobotAirbotEEFDataConfig(
-            repo_id="teleop_eef",
-            gripper_pc_path="gripper_geom/parallel.npy",
-            num_gripper_points=512,
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=30_000,
-        batch_size=32,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-    ),
-    #
-    # 方案C 多爪共训: parallel(遥操作) + GET(UMI) 混训, 每帧按 gripper_id 查 grippers.npz
-    # 选夹爪点云。token 的有效性在这里才可测(token on/off、错 token、留出爪)。
-    # 数据需用 pack_lerobot.py 打好 gripper_id(遥操作=0, UMI=1); grippers.npz 被
-    # gitignore, 服务器上要自行放到该路径。对照(token off)= 同数据的 pi05_cotrain_eef。
-    #
-    TrainConfig(
-        name="pi05_cotrain_eef_grip",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=10,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-            gripper_token=True,
-            num_gripper_points=512,
-        ),
-        data=LeRobotAirbotEEFDataConfig(
-            repo_id="cotrain_eef",
-            grippers_npz_path="gripper_geom/grippers.npz",
-            gripper_names=("parallel", "get"),
-            num_gripper_points=512,
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=30_000,
-        batch_size=32,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-    ),
-    # 方案C + 点云增强: 同 pi05_cotrain_eef_grip, 但训练时对夹爪点云做几何增强
-    # (jitter/dropout/开合/scale/微旋转, 见 gripper_geom/gripper_aug.py; 部署喂干净点云)。
-    # 与 pi05_cotrain_eef_grip 做 A/B, 看增强是否有益 / 是否伤害成功率。
-    TrainConfig(
-        name="pi05_cotrain_eef_grip_aug",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=10,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-            gripper_token=True,
-            num_gripper_points=512,
-        ),
-        data=LeRobotAirbotEEFDataConfig(
-            repo_id="cotrain_eef",
-            grippers_npz_path="gripper_geom/grippers.npz",
-            gripper_names=("parallel", "get"),
-            num_gripper_points=512,
-            gripper_aug=True,
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=30_000,
-        batch_size=32,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-    ),
-    # 双臂 20D(stage1): 单臂300条(臂1=rest+mask) + 双臂(切橡皮泥)混训。state/actions=20D,
-    # 3 相机(env + 两手眼, 臂1相机按 arm1_mask 屏蔽), 夹爪 token 目前=臂0(stage2 再加臂1 token)。
-    # 数据用 pack_lerobot.py --dual-arm 打包成 repo_id=cotrain_dualarm。
-    TrainConfig(
-        name="pi05_cotrain_dualarm",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=10,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-            gripper_token=True,
-            num_gripper_points=512,
-        ),
-        data=LeRobotAirbotEEFDataConfig(
-            repo_id="cotrain_dualarm3",   # 消融梯 b 档: 全局 token, 数据与 region/film 档严格一致
-            grippers_npz_path="gripper_geom/grippers.npz",
-            gripper_names=("parallel", "get"),
-            num_gripper_points=512,
-            gripper_aug=True,
-            dual=True,
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        # batch48 + 34k步 ≈ batch32 + 50k步(同epoch); LR随batch按~1.4x线性缩放补偿更少的更新次数。
-        num_train_steps=34_000,
-        batch_size=48,
-        num_workers=8,  # 默认2太低; 16 会导致 worker spawn 的 pickle 截断, 8 稳且够喂 2xH200
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=3.5e-5,
-            decay_steps=34_000,
-            decay_lr=3.5e-6,
-        ),
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-    ),
     # ------------------------------------------------------------------
-    # 消融梯(4 档, 同数据 cotrain_dualarm3 = 550条: 400单臂含两爪挂杯 + 150双臂切泥):
-    #   a) _vanilla: 无 token/无点云增强(等价原版 openpi + 我们的数据接口)
-    #   b) pi05_cotrain_dualarm: 全局 1 token/爪
-    #   c) _region: tip/mid/rear 3 token/爪
-    #   d) _film:   region + FiLM 几何注入(方案B, 修复 token 被注意力无视的问题)
-    # 除模型开关外全部超参一致; 各 config 的 norm_stats 需各自计算(或复制同数据的)。
+    # 消融梯(同数据 cotrain_dualarm3 = 550条: 400单臂含两爪挂杯 + 150双臂切泥):
+    #   a) _vanilla:   无 token/无点云增强(等价原版 openpi + 我们的数据接口)
+    #   b) _region:    tip/mid/rear 3 token/爪(prefix 注入; 探针判决: 被注意力无视)
+    #   c) _film:      region + FiLM 注入(方案B; 探针判决: 被主动收缩, 镜像范数曲线)
+    #   d) _film_drop: film + 互斥相机遮断(打破视觉冗余 -> 当前主线)
+    # 除模型开关外全部超参一致; norm_stats 同数据可直接复制。
+    # (更早的 10D单臂/全局token 等历史配置已删, 要用时从 git 历史找回)
     # ------------------------------------------------------------------
     # 区域化几何 token: 每爪 tip/mid/rear 3 token(共享 PointNet + 零初始化区域嵌入)。
     TrainConfig(
@@ -1373,7 +1165,7 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
-    # 消融梯 e 档: film + 互斥相机遮断。film_v1 判决: 结构注入也被主动收缩
+    # 消融梯 d 档(当前主线): film + 互斥相机遮断。film_v1 判决: 结构注入也被主动收缩
     # (gripper_param_norm 镜像下压 + 纵向探针 1.3x->1.1x 衰减)——瓶颈是视觉冗余
     # 下没有梯度压力, 不是注入路。遮断(30%丢腕/15%丢env/永不全丢)让丢腕样本里
     # 爪身份只剩点云一条路。验收: wandb probe/roll_ratio 持续明显>1, 离线探针挂杯 swap>1。
@@ -1417,7 +1209,7 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
-    # 消融梯 d 档: region + FiLM 几何注入(方案B)。动机: probe_token_swap 实测 region_v1
+    # 消融梯 c 档: region + FiLM 几何注入(方案B)。动机: probe_token_swap 实测 region_v1
     # 对 swap/全零/随机点云均 ≈1.0x 噪声地板(prefix token 被注意力整体无视); FiLM 把几何
     # 加进动作专家每层 adaRMS cond, 不经注意力竞争。验收: 新 checkpoint 重跑探针, swap 倍数应>1。
     TrainConfig(
