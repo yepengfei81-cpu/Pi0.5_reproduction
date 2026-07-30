@@ -1165,10 +1165,11 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
-    # 消融梯 d 档(当前主线): film + 互斥相机遮断。film_v1 判决: 结构注入也被主动收缩
-    # (gripper_param_norm 镜像下压 + 纵向探针 1.3x->1.1x 衰减)——瓶颈是视觉冗余
-    # 下没有梯度压力, 不是注入路。遮断(30%丢腕/15%丢env/永不全丢)让丢腕样本里
-    # 爪身份只剩点云一条路。验收: wandb probe/roll_ratio 持续明显>1, 离线探针挂杯 swap>1。
+    # 消融梯 d 档(当前主线): film + 分段相机遮断。film_v1 判决: 结构注入也被主动收缩;
+    # 遮断方案 v1(30%腕/15%env/无盲段)10k 探针与不遮断无差别——env 残余识别力泄压。
+    # 方案 v2(2026-07-30 起): 45%只丢腕 / 15%只丢env / 10%全丢(盲样本: 仅
+    # state+prompt+点云, 身份唯一来源=点云, 压力最纯) / 30%全保留。
+    # 验收: 离线探针挂杯 swap 明显>1(对照 film_v1@10k 的 1.1x)。
     TrainConfig(
         name="pi05_cotrain_dualarm_film_drop",
         model=pi0_config.Pi0Config(
@@ -1180,7 +1181,7 @@ _CONFIGS = [
             num_gripper_points=256,
             region_tokens=True,
             film_geometry=True,
-            cam_dropout=(0.30, 0.15),
+            cam_dropout=(0.45, 0.15, 0.10),
         ),
         data=LeRobotAirbotEEFDataConfig(
             repo_id="cotrain_dualarm3",

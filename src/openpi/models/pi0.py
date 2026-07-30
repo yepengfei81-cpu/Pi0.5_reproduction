@@ -82,13 +82,15 @@ class PointNetEncoder(nnx.Module):
 
 
 def _drop_cameras(rng, obs, probs):
-    """互斥相机遮断(训练期): u<p_w 丢所有腕相机, p_w<=u<p_w+p_e 只丢 env——永不全丢。
+    """分段相机遮断(训练期): u<p_w 丢所有腕相机; 接着 p_e 只丢 env; 接着 p_b 全丢
+    (盲样本: 剩 state+prompt+点云, 爪身份唯一来源=点云, 梯度压力最纯)。
     丢 = 图像置零 + image_mask 置 False(token 层被注意力屏蔽)。目的: 打破"爪身份
-    可从腕相机读出"的视觉冗余, 给几何通道(点云 token/FiLM)制造真实梯度压力。"""
-    p_w, p_e = probs
+    可从相机读出"的视觉冗余, 给几何通道(点云 token/FiLM)制造真实梯度压力。"""
+    p_w, p_e, p_b = probs
     u = jax.random.uniform(rng, (obs.state.shape[0],))
-    drop_wrist = u < p_w
-    drop_env = (u >= p_w) & (u < p_w + p_e)
+    blind = (u >= p_w + p_e) & (u < p_w + p_e + p_b)
+    drop_wrist = (u < p_w) | blind
+    drop_env = ((u >= p_w) & (u < p_w + p_e)) | blind
     images = dict(obs.images)
     masks = dict(obs.image_masks)
     for k in images:
@@ -146,8 +148,9 @@ class Pi0(_model.BaseModel):
             self.gripper_film_proj_1 = nnx.Linear(
                 n_reg * paligemma_config.width, action_expert_config.width,
                 kernel_init=nnx.initializers.zeros_init(), rngs=rngs)
-        assert sum(config.cam_dropout) <= 1.0, "cam_dropout 两概率之和须<=1(互斥分段)"
-        self.cam_dropout = tuple(config.cam_dropout)
+        cd = tuple(config.cam_dropout) + (0.0,) * 3   # 兼容 2 元组旧写法
+        assert sum(cd[:3]) <= 1.0, "cam_dropout 概率之和须<=1(互斥分段)"
+        self.cam_dropout = cd[:3]
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
