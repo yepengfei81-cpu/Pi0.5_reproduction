@@ -423,6 +423,11 @@ class LeRobotAirbotEEFDataConfig(DataConfigFactory):
     # 开启后查表存"全爪点云+逐点区域标签"(训练先整爪增强、再按标签拆区, 防止把爪撕开),
     # num_gripper_points 语义变为【每区】点数(建议 256)。需 grippers.npz 含 {name}_region/_finger。
     region_tokens: bool = False
+    # 机械臂参考点(ARP)系 / 去几何标定: 打包时 state/action 用臂原始报点(不加 tcp_offset),
+    # 点云用 align_to_arm_frame.py 产出的 grippers_armframe.npz(指尖落在各爪真实偏移处)。
+    # 于是"指尖伸多远"只能从点云读 -> 每帧稠密梯度压力。同时关闭点云尺度抖动。
+    # 数据与默认(指尖锚定)不兼容, 必须配套的 repo_id/norm_stats。
+    arm_frame: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -491,7 +496,8 @@ class LeRobotAirbotEEFDataConfig(DataConfigFactory):
                 gripper_pc=gripper_pc, gripper_clouds=gripper_clouds,
                 gripper_regions=gripper_regions, gripper_fingers=gripper_fingers,
                 region_tokens=self.region_tokens, region_points=self.num_gripper_points,
-                augment=self.gripper_aug, dual=self.dual)],
+                augment=self.gripper_aug, dual=self.dual,
+                preserve_scale=self.arm_frame)],
             outputs=[airbot_eef_policy.AirbotEEFOutputs(dual=self.dual)],
         )
         # 注意: EEF 用 W' 相对系(已去掉全局偏移), 且 rot6d 不适合做差分, 故不加
@@ -1165,7 +1171,54 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
-    # 消融梯 d 档(当前主线): film + 分段相机遮断。film_v1 判决: 结构注入也被主动收缩;
+    # 消融梯 e 档(v3, 当前主线): 去几何标定 —— 位姿锚在机械臂报点(ARP), "指尖伸多远"
+    # 只能从点云读(GET 指尖 +17mm / parallel 0mm), 每帧稠密压力。
+    # 依据: v2 探针首次出现随训练【增强】的敏感度(随机点云 1.5x@10k -> 2.4x@34k), 通道
+    # 已通电; 但 swap 各切片均匀 1.3-1.5x = 有敏感无语义(不认"这是谁")。原因是标定接口
+    # 把两爪差异抹平, 身份没有价值。去标定让身份变成"算错就差 17mm"的硬信息。
+    # 前置: grippers_armframe.npz(align_to_arm_frame.py 产出) + cotrain_dualarm4(--arm-frame 打包)。
+    TrainConfig(
+        name="pi05_cotrain_dualarm_armframe",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            gripper_token=True,
+            num_gripper_points=256,
+            region_tokens=True,
+            film_geometry=True,
+            cam_dropout=(0.45, 0.15, 0.10),   # 同 v2, 控制变量: 本轮唯一变化是去标定
+        ),
+        data=LeRobotAirbotEEFDataConfig(
+            repo_id="cotrain_dualarm4",
+            grippers_npz_path="gripper_geom/grippers_armframe.npz",
+            gripper_names=("parallel", "get"),
+            num_gripper_points=256,
+            gripper_aug=True,
+            dual=True,
+            region_tokens=True,
+            arm_frame=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=34_000,
+        batch_size=48,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=3.5e-5,
+            decay_steps=34_000,
+            decay_lr=3.5e-6,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # 消融梯 d 档: film + 分段相机遮断。film_v1 判决: 结构注入也被主动收缩;
     # 遮断方案 v1(30%腕/15%env/无盲段)10k 探针与不遮断无差别——env 残余识别力泄压。
     # 方案 v2(2026-07-30 起): 45%只丢腕 / 15%只丢env / 10%全丢(盲样本: 仅
     # state+prompt+点云, 身份唯一来源=点云, 压力最纯) / 30%全保留。

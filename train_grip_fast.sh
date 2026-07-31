@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=train_filmdrop_rq
+#SBATCH --job-name=train_armframe_rq
 #SBATCH --partition=gpu_requeue
 #SBATCH --requeue
 #SBATCH --open-mode=append
@@ -17,10 +17,10 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
 export HF_LEROBOT_HOME=/n/home08/yxma/ypf/pi_data
 cd ~/ypf/Pi0.5_reproduction
 
-CONFIG=pi05_cotrain_dualarm_film_drop
-DATA="$HF_LEROBOT_HOME/cotrain_dualarm3/meta/info.json"
-NORM="assets/$CONFIG/cotrain_dualarm3/norm_stats.json"
-CKPT_DIR="checkpoints/$CONFIG/film_drop_v1"
+CONFIG=pi05_cotrain_dualarm_armframe
+DATA="$HF_LEROBOT_HOME/cotrain_dualarm4/meta/info.json"
+NORM="assets/$CONFIG/cotrain_dualarm4/norm_stats.json"
+CKPT_DIR="checkpoints/$CONFIG/armframe_v1"
 
 # Wait for dataset + norm_stats (max 4 hours, then give up instead of holding GPUs).
 echo ">>> GPUs allocated ($(date)); waiting for dataset + norm_stats..."
@@ -50,6 +50,6 @@ set -e
 # save-interval=5000 是抢占保险(gpu_requeue), 不能去; keep-period=None + orbax
 # max_to_keep=1 => 任意时刻只留最新一档滚动, 训完只剩终档(33999), 不再攒 10000 的倍数。
 uv run --no-sync scripts/train.py $CONFIG \
-  --exp-name=film_drop_v1 $MODE \
+  --exp-name=armframe_v1 $MODE \
   --save-interval=5000 \
   --keep-period=None

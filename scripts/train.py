@@ -213,7 +213,7 @@ def probe_step(
     持续明显>1 = 几何通道活着; 贴着1 = 被无视(film_v1 的病)。"""
     model = nnx.merge(state.model_def, state.params)
     model.eval()
-    obs, _ = batch
+    obs, actions = batch
 
     def swap_pc(fn):
         return dataclasses.replace(
@@ -229,8 +229,13 @@ def probe_step(
     def d(x, y):
         return jnp.mean(jnp.abs(x - y))
 
+    # clean_loss: 关遮断+关图像增强+固定噪声种子的"干净拟合度"。训练 loss 因遮断而抬高
+    # (盲样本有不可约歧义), 跨运行不可比; 这个数才可比——它回答"全相机在位时拟合得好不好"。
+    clean_loss = jnp.mean(model.compute_loss(jax.random.key(2), obs, actions, train=False))
+
     floor = d(a, a_alt)
     return {
+        "probe/clean_loss": clean_loss,
         "probe/noise_floor": floor,
         "probe/zero_dact": d(a, a_zero),
         "probe/roll_dact": d(a, a_roll),
@@ -328,7 +333,8 @@ def main(config: _config.TrainConfig):
                 probe_info = jax.device_get(pprobe_step(train_state, batch))
             pbar.write(f"Step {step}: probe roll={probe_info['probe/roll_ratio']:.2f}x "
                        f"zero={probe_info['probe/zero_ratio']:.2f}x "
-                       f"(floor={probe_info['probe/noise_floor']:.4f})")
+                       f"(floor={probe_info['probe/noise_floor']:.4f}, "
+                       f"clean_loss={probe_info['probe/clean_loss']:.4f})")
             wandb.log(probe_info, step=step)
         batch = next(data_iter)
 

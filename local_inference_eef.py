@@ -72,11 +72,14 @@ def nlerp(q0, q1, a):
 class _ArmCtx:
     """单条臂的部署上下文: 句柄 + 该爪开合范围/指尖偏移 + 点云 token + W' 帧 + servo 插值状态。"""
 
-    def __init__(self, handle, gripper_name, gripper_cloud):
+    def __init__(self, handle, gripper_name, gripper_cloud, arm_frame=False):
         self.h = handle
         gp = get_params(gripper_name)
         self.g_close = float(gp["close"]); self.g_open = float(gp["open"])
-        self.tcp_offset = np.asarray(gp["tcp_offset"], float)
+        # arm_frame(去几何标定的模型): 位姿直接用机械臂报点, 不补指尖偏移——
+        # 模型自己从点云读出指尖伸多远。开合标定仍需要(传动比不在点云里)。
+        self.tcp_offset = (np.zeros(3) if arm_frame
+                           else np.asarray(gp["tcp_offset"], float))
         self.name = gripper_name
         self.pc = gripper_cloud            # (P,3) 已子采样; None=不注入
         self.start_pos = None; self.start_yaw = None
@@ -166,6 +169,15 @@ class EEFRunner:
         # 全局模式 -> (P,3) 1 token; 区域化模型(region_tokens) -> (3,P,3) tip/mid/rear 各 P 点。
         # 部署一律喂未增强的规范点云(与训练时 obs 直喂分支一致)。
         cloud0 = cloud1 = None
+        # 去几何标定(arm_frame)模型: 位姿锚在机械臂报点, 点云须用 ARP 系那份。
+        # --grippers-npz 未显式指定时一律跟随 config, 避免喂错坐标系的点云。
+        self.arm_frame = bool(getattr(self.cfg.data, "arm_frame", False))
+        if a.grippers_npz is None:
+            npz_cfg = getattr(self.cfg.data, "grippers_npz_path", None)
+            a.grippers_npz = str(_ROOT / (npz_cfg or "gripper_geom/grippers.npz"))
+        if self.arm_frame:
+            print(f">>> arm_frame 模型: 位姿=机械臂报点(不补指尖偏移); 点云={a.grippers_npz}",
+                  flush=True)
         if getattr(self.cfg.model, "gripper_token", False):
             z = np.load(a.grippers_npz, allow_pickle=True)
             P = int(getattr(self.cfg.model, "num_gripper_points", 512))
@@ -211,8 +223,9 @@ class EEFRunner:
                                wrist1_serial=wrist1_serial)
         print(">>> [4/4] 连接完成", flush=True)
 
-        self.arm0 = _ArmCtx(arm0_handle, a.arm0_gripper, cloud0)
-        self.arm1 = _ArmCtx(arm1_handle, a.arm1_gripper, cloud1) if arm1_handle else None
+        self.arm0 = _ArmCtx(arm0_handle, a.arm0_gripper, cloud0, self.arm_frame)
+        self.arm1 = (_ArmCtx(arm1_handle, a.arm1_gripper, cloud1, self.arm_frame)
+                     if arm1_handle else None)
         self.pc1 = cloud1   # 20D 模型只驱动臂0时也照喂(被 arm1_mask=0 屏蔽)
 
         if self.show:
@@ -482,7 +495,7 @@ def main():
                     help="token-swap 诊断: 只换臂0喂模型的爪点云(运动学标定仍用 --arm0-gripper); "
                          "如实装 parallel 时传 get。默认=同 --arm0-gripper")
     ap.add_argument("--arm1-cloud", default=None, help="同上, 覆盖臂1点云")
-    ap.add_argument("--grippers-npz", default=str(_ROOT / "gripper_geom" / "grippers.npz"),
+    ap.add_argument("--grippers-npz", default=None,   # None=跟随 config 的 grippers_npz_path
                     help="多爪点云库, 按爪名取(与训练同源)")
     # 相机
     ap.add_argument("--head-serial", default="230422271972", help="环境(头)相机 SN")

@@ -322,6 +322,9 @@ def main():
     ap.add_argument("--repo-id", default="cotrain_dualarm2")
     ap.add_argument("--template", default="/home/ypf/pi_data/cotrain_dualarm2",
                     help="schema 模板(现有同构打包集); --append 时自动用输出集自身")
+    ap.add_argument("--arm-frame", action="store_true",
+                    help="去几何标定: state/action 用机械臂原始报点(不加 tcp_offset), "
+                         "'指尖伸多远'改由点云提供(须配 grippers_armframe.npz + arm_frame config)")
     ap.add_argument("--append", action="store_true", help="增量: 跳过 manifest 里已打包的源 episode")
     ap.add_argument("--link", action="store_true", help="硬链接代替复制(同分区, 零拷贝)")
     ap.add_argument("--limit", type=int, default=None)
@@ -339,6 +342,14 @@ def main():
     tmpl_info = json.loads((tmpl_root / "meta" / "info.json").read_text(encoding="utf-8"))
 
     name_to_id = {n: i for i, n in enumerate(args.gripper_names)}
+
+    def gparams(name):
+        p = dict(get_params(name))
+        if args.arm_frame:                    # 位姿锚点 = 臂原始报点(ARP), 不再补到指尖
+            p["tcp_offset"] = (0.0, 0.0, 0.0)
+        return p
+    if args.arm_frame:
+        print(">>> --arm-frame: state/action 锚在机械臂报点(不加 tcp_offset)")
 
     # ---- manifest / 既有状态 ----
     mf_path = out / "pack_manifest.json"
@@ -418,7 +429,7 @@ def main():
     tg = args.teleop_gripper if len(args.teleop_gripper) != 1 else args.teleop_gripper * len(args.teleop_dir)
     for d, gname in zip(args.teleop_dir, tg):
         troot = Path(d).expanduser().resolve()
-        gp = get_params(gname); gid = name_to_id[gname]
+        gp = gparams(gname); gid = name_to_id[gname]
         src_tasks = load_source_tasks(troot)
         pqs = sorted((troot / "data").rglob("episode_*.parquet"))[: args.limit or None]
         print(f"[单臂 {troot.name}] {len(pqs)} 条 爪={gname}")
@@ -445,7 +456,7 @@ def main():
             n_new += 1
 
     # ---- 双臂 ----
-    gp0, gp1 = get_params(args.dualarm_gripper[0]), get_params(args.dualarm_gripper[1])
+    gp0, gp1 = gparams(args.dualarm_gripper[0]), gparams(args.dualarm_gripper[1])
     gid0, gid1 = name_to_id[args.dualarm_gripper[0]], name_to_id[args.dualarm_gripper[1]]
     for d in args.dualarm_dir:
         droot = Path(d).expanduser().resolve()

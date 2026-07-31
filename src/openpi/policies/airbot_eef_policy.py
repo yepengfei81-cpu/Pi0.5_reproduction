@@ -67,6 +67,14 @@ class AirbotEEFInputs(transforms.DataTransformFn):
     gripper_fingers: np.ndarray | None = None
     region_tokens: bool = False
     region_points: int = 256
+    # 机械臂参考点(ARP)系: 点云原点=臂报点, 指尖位置 = 该爪真实偏移 -> 尺度抖动会把
+    # "点云显示的指尖位置"和"标签对应的真实偏移"打散(±5%×90mm≈±4.5mm), 正好污染我们
+    # 要学的信号, 故关闭。其余增强(开合/微旋转/噪声/dropout)不改变 +X 指尖位置, 保留。
+    preserve_scale: bool = False
+
+    @property
+    def _aug_kw(self) -> dict:
+        return {"scale_range": (1.0, 1.0)} if self.preserve_scale else {}
 
     def _aug(self, cloud: np.ndarray) -> np.ndarray:
         """train-only 几何增强 + 重采样回原点数(dropout 改了点数也保持固定 P)。"""
@@ -75,7 +83,7 @@ class AirbotEEFInputs(transforms.DataTransformFn):
         if _augment_cloud is None:
             raise RuntimeError("augment=True 但导入不到 gripper_geom/gripper_aug.py")
         P = cloud.shape[0]
-        a = _augment_cloud(cloud)                     # finger_id=None -> 按 sign(Y) 开合; 用锁定默认范围
+        a = _augment_cloud(cloud, **self._aug_kw)     # finger_id=None -> 按 sign(Y) 开合
         if len(a) != P:
             idx = np.random.default_rng().choice(len(a), P, replace=len(a) < P)
             a = a[idx]
@@ -133,7 +141,7 @@ class AirbotEEFInputs(transforms.DataTransformFn):
                     raise RuntimeError("augment=True 但导入不到 gripper_geom/gripper_aug.py")
                 fid = (np.asarray(self.gripper_fingers[gid])
                        if self.gripper_fingers is not None else None)
-                cloud, reg = _augment_cloud(cloud, finger_id=fid, labels=reg)
+                cloud, reg = _augment_cloud(cloud, finger_id=fid, labels=reg, **self._aug_kw)
             rng = np.random.default_rng() if self.augment else np.random.default_rng(0)
             out = []
             for r in range(3):
