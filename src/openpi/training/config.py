@@ -1188,7 +1188,11 @@ _CONFIGS = [
             num_gripper_points=256,
             region_tokens=True,
             film_geometry=True,
-            cam_dropout=(0.45, 0.15, 0.10),   # 同 v2, 控制变量: 本轮唯一变化是去标定
+            # v2(交付档): 机制实验收官后降遮挡保精度 —— 30%只遮腕/10%只遮env/8%全盲,
+            # 52% 完好(v1 是 45/15/10, 仅 30% 完好, 实测挂杯成功率低于无遮挡权重)。
+            # 全盲带保留: 它是"点云=身份唯一来源"的训练信号, 真机 21mm 模式切换演示的生命线。
+            # armframe_v1(45/15/10) 的探针结论: 区域乱序最大效应 + 视觉剥夺剂量-反应, 见 git 历史。
+            cam_dropout=(0.30, 0.10, 0.08),
         ),
         data=LeRobotAirbotEEFDataConfig(
             repo_id="cotrain_dualarm4",

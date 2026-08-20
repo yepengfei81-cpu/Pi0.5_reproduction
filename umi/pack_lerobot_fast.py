@@ -7,6 +7,10 @@
   - 状态转换数学(_arm_state_action/build_wprime/REST10 等)从旧脚本【逐字内联】进本文件
     (见下方"内联数学"段), 与旧打包逐元素一致; 本脚本已自包含, 不再 import pack_lerobot。
   - manifest 增量: pack_manifest.json 记录每条源 episode 的打包去向, --append 只处理新增。
+  - 打包账本: 每次打包自动把增量所需的全部状态(manifest + meta四件套 + schema样本, 共几MB)
+    存到 <数据根>/_pack_ledger/<repo_id>/ —— 【打包产物上传后可安全删除】。之后 --append
+    自动从账本续: 输出目录只含新增 episode + 更新后的完整 meta, rsync(不带 --delete)
+    合并进服务器上的全集即可。
   - 单臂样本的 wrist_image_1 黑视频用 ffmpeg lavfi 生成(按长度缓存复用), 不逐帧编码。
 
 限制: 只支持双臂 20D schema(现行主线); UMI mcap/单臂10D 旧格式才需要旧 pack_lerobot.py
@@ -334,12 +338,26 @@ def main():
     import pyarrow.parquet as pq
 
     out = Path(args.output).expanduser().resolve()
-    tmpl_root = out if args.append else Path(args.template).expanduser().resolve()
-    tmpl_pq = sorted((tmpl_root / "data").rglob("episode_*.parquet"))
-    if not tmpl_pq:
-        sys.exit(f"模板 {tmpl_root} 里找不到 parquet(需要一个现成的双臂20D打包集当 schema 模板)")
-    tmpl_schema = pq.read_schema(tmpl_pq[0])
-    tmpl_info = json.loads((tmpl_root / "meta" / "info.json").read_text(encoding="utf-8"))
+    ledger = out.parent / "_pack_ledger" / args.repo_id
+    # delta 模式: --append 但本地打包产物已删(上传后清理), 账本还在 -> 从账本续,
+    # 输出目录只写【新增】episode + 完整 meta, rsync 合并进服务器上的全集。
+    delta = (args.append and not (out / "pack_manifest.json").exists()
+             and (ledger / "pack_manifest.json").exists())
+    if delta:
+        if (out / "meta").exists():
+            sys.exit(f"{out} 存在却没有 manifest(不完整?); delta 续打需先清掉它")
+        print(f">>> delta 续打: 本地无打包产物, 从账本 {ledger} 恢复状态; "
+              f"输出只含新增 episode, 需 rsync 合并进服务器全集")
+        tmpl_schema = pq.read_schema(sorted(ledger.glob("schema_*.parquet"))[0])
+        tmpl_info = json.loads((ledger / "info.json").read_text(encoding="utf-8"))
+    else:
+        tmpl_root = out if args.append else Path(args.template).expanduser().resolve()
+        tmpl_pq = sorted((tmpl_root / "data").rglob("episode_*.parquet"))
+        if not tmpl_pq:
+            sys.exit(f"模板 {tmpl_root} 里找不到 parquet(需要一个现成的双臂20D打包集当 schema 模板"
+                     f"; 若是 --append 且产物已删, 账本 {ledger} 也不存在)")
+        tmpl_schema = pq.read_schema(tmpl_pq[0])
+        tmpl_info = json.loads((tmpl_root / "meta" / "info.json").read_text(encoding="utf-8"))
 
     name_to_id = {n: i for i, n in enumerate(args.gripper_names)}
 
@@ -353,7 +371,21 @@ def main():
 
     # ---- manifest / 既有状态 ----
     mf_path = out / "pack_manifest.json"
-    if args.append:
+    if args.append and delta:
+        manifest = json.loads((ledger / "pack_manifest.json").read_text(encoding="utf-8"))
+        tasks = {}
+        for line in (ledger / "tasks.jsonl").read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                d = json.loads(line); tasks[d["task"]] = int(d["task_index"])
+        ep_idx = manifest["next_episode"]
+        g_index = manifest["next_index"]
+        for sub in ("data", "meta"):
+            (out / sub).mkdir(parents=True, exist_ok=True)
+        # 预填既有 meta(episodes/stats 两个追加型文件), 之后照常 "a" 追加新行
+        for f in ("episodes.jsonl", "episodes_stats.jsonl"):
+            shutil.copy2(ledger / f, out / "meta" / f)
+        ep_lines, stat_lines = [], []
+    elif args.append:
         if not mf_path.exists():
             sys.exit("--append 需要输出目录里有 pack_manifest.json(即之前由 v2 打包)")
         manifest = json.loads(mf_path.read_text(encoding="utf-8"))
@@ -369,10 +401,16 @@ def main():
             sys.exit(f"{out} 已存在; 全量重建请换目录或先删除, 增量请用 --append")
         for sub in ("data", "meta"):
             (out / sub).mkdir(parents=True, exist_ok=True)
-        manifest = {"version": 1, "entries": {}, "next_episode": 0, "next_index": 0}
+        manifest = {"version": 1, "entries": {}, "next_episode": 0, "next_index": 0,
+                    "arm_frame": bool(args.arm_frame)}
         tasks = {}
         ep_idx = 0; g_index = 0
         ep_lines, stat_lines = [], []
+
+    # 防呆: 追加时锚定方式必须与原打包一致(锚点混用 = 数据集内部自相矛盾)
+    if args.append and "arm_frame" in manifest and bool(args.arm_frame) != manifest["arm_frame"]:
+        sys.exit(f"锚定方式不一致: 该数据集打包时 arm_frame={manifest['arm_frame']}, "
+                 f"本次 --arm-frame={bool(args.arm_frame)}。追加必须用同一种锚定。")
 
     done = set(manifest["entries"].keys())
     black_cache_dir = out / "_black_cache"   # 放 videos/ 外, 不污染数据集视频计数
@@ -503,11 +541,25 @@ def main():
     (meta / "info.json").write_text(json.dumps(info, indent=4, ensure_ascii=False), encoding="utf-8")
 
     manifest["next_episode"] = ep_idx; manifest["next_index"] = g_index
+    manifest.setdefault("arm_frame", bool(args.arm_frame))
     mf_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
 
     print(f"\n===== pack v2 完成 =====")
     print(f"  新打包 {n_new} 条(跳过已有 {n_skip}), 总计 {ep_idx} 条 / {g_index} 帧")
     print(f"  输出: {out}")
+    if delta:
+        print("  ⚠ delta 续打: 上面的'总计'是全集逻辑规模; 本目录只含新增 episode + 完整 meta,")
+        print("    用平时的 rsync(不带 --delete!)合并进服务器全集即可。")
+
+    # ---- 打包账本: 增量所需的全部状态(几MB), 打包产物上传后可安全删除 ----
+    ledger.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(mf_path, ledger / "pack_manifest.json")
+    for f in ("episodes.jsonl", "episodes_stats.jsonl", "tasks.jsonl", "info.json"):
+        shutil.copy2(out / "meta" / f, ledger / f)
+    if not any(ledger.glob("schema_*.parquet")):
+        src_pq = sorted((out / "data").rglob("episode_*.parquet"))[0]
+        shutil.copy2(src_pq, ledger / f"schema_{src_pq.stem.split('_')[1]}.parquet")
+    print(f"  ✓ 打包账本已更新: {ledger}  (以后删掉打包产物也能 --append 续打)")
 
     # 服务器兼容: parquet 元数据 List->Sequence(datasets 3.x 才能读)。
     # 注意模板若来自未跑完的旧打包会遗留 "List", 这里兜底保证产物永远是修补过的。

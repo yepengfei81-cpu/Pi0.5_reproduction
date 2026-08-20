@@ -150,6 +150,11 @@ def main():
     ap.add_argument("--frames-per-ep", type=int, default=3)
     ap.add_argument("--draws", type=int, default=1,
                     help="每条件推理次数取均值: 地板降√K倍, 检测更小的效应(耗时xK)")
+    ap.add_argument("--blind", choices=["wrist", "env", "all"], default=None,
+                    help="遮相机后再做全部探针, 判决'视觉后门'假说。"
+                         "wrist=只遮腕(env 仍看得见爪, 后门未关, 对应训练的45%分段); "
+                         "env=只遮环境; all=两路全遮(对应训练的10%盲样本, 点云是唯一身份来源"
+                         "——【这才是判决性条件】)")
     ap.add_argument("--nan-check", action="store_true",
                     help="连通性检查: 点云灌 NaN, 输出必被污染=点云确实进图; 干净=管线断了")
     args = ap.parse_args()
@@ -199,6 +204,13 @@ def main():
         g1 = grip[1] if isinstance(grip, tuple) else grip   # 单臂: 臂1点云无所谓(mask=0), 喂同名
         for pqf in pqs:
             for obs, tag in episode_obs(root, pqf, grip, args.frames_per_ep, arm_frame):
+                if args.blind in ("wrist", "all"):        # 腕相机置黑(训练里丢腕分段)
+                    for k in ("observation/wrist_image", "observation/wrist_image_1"):
+                        if obs.get(k) is not None:
+                            obs[k] = np.zeros_like(obs[k])
+                if args.blind in ("env", "all"):          # env 置黑 + env_mask=0(可精确复现)
+                    obs["observation/image"] = np.zeros_like(obs["observation/image"])
+                    obs["observation/env_mask"] = np.float32(0.0)
                 def infer(c0):
                     o = dict(obs)
                     o["observation/gripper_pc"] = c0

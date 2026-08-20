@@ -156,6 +156,12 @@ class EEFRunner:
 
         print(f">>> [1/4] 加载模型 ({a.config_name})...", flush=True)
         self.cfg = _config.get_config(a.config_name)
+        # 防呆: checkpoint 路径是 checkpoints/<config>/<exp>/<step>, 目录名≠--config-name
+        # 多半是拿错了配置(权重结构对不上会在下面报 PyTree 错, 提示不直观)。
+        _parts = pathlib.Path(a.checkpoint).resolve().parts
+        if len(_parts) >= 3 and _parts[-3] != a.config_name:
+            print(f">>> ⚠ checkpoint 路径里的配置名是 '{_parts[-3]}', 但 --config-name 给的是 "
+                  f"'{a.config_name}' —— 若接下来报 PyTree 结构不匹配, 改用前者", flush=True)
         self.policy = _policy_config.create_trained_policy(
             self.cfg, pathlib.Path(a.checkpoint), default_prompt=self.task)
         # 模型维度: 20D 双臂模型(data.dual=True) or 10D 单臂模型
