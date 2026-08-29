@@ -42,6 +42,11 @@ class Pi0Config(_model.BaseModelConfig):
     # 爪身份唯一来源是点云, 压力最纯; v1 无盲段实测 env 残余识别力泄压, 10k 探针
     # 与不遮断无差别)。部署不受影响。
     cam_dropout: tuple[float, ...] = (0.0, 0.0, 0.0)
+    # force-aware Level A: 力矩前向预测辅助头维度(0=关)。与 action_out_proj 平行, 吃同一份
+    # 动作专家 suffix 特征 -> 预测未来 chunk 的 (H, effort_dim) 力矩(归一化后 MSE, 按 effort_mask
+    # 与 arm1_mask 屏蔽)。推理不用该头。effort_loss_weight 为其相对动作 loss 的权重。
+    effort_dim: int = 0
+    effort_loss_weight: float = 0.05
 
     # Set the model specific defaults.
     action_dim: int = 32
@@ -106,6 +111,10 @@ class Pi0Config(_model.BaseModelConfig):
                     [batch_size, 3, self.num_gripper_points, 3] if self.region_tokens
                     else [batch_size, self.num_gripper_points, 3], jnp.float32)
                             if self.gripper_token else None),
+                effort=(jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.effort_dim], jnp.float32)
+                        if self.effort_dim > 0 else None),
+                effort_mask=(jax.ShapeDtypeStruct([batch_size, 1], jnp.float32)
+                             if self.effort_dim > 0 else None),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 

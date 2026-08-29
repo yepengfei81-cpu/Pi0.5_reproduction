@@ -14,6 +14,7 @@
 | 挂马克杯(parallel) | `hang the mug on the mug tree`(同 prompt, 跨爪A/B) | 右臂单臂 / parallel | 同上(右臂 J4 朝右+90°) | 随机化范围与 GET 版完全一致; 抓法: 同 GET 抓杯沿(已验证可行, 但靠摩擦会下滑一段——正是 GET 形封闭 vs 平行爪摩擦的力学对照, 示教中自然补偿即可) |
 | 切橡皮泥(新握法) | `cut the play-dough with the knife` | 双臂 / 臂0=GET 臂1=parallel | **左臂 J4 朝右, 右臂 J4 朝左** | 法向抓握(夹爪开合⊥刀柄), 免换手; **刀刃固定朝左**; 刀yaw±10-15°、刀/泥位置随机、开局抖动 |
 | 切橡皮泥(parallel) | `cut the play-dough with the knife`(同 prompt, 跨爪A/B) | 双臂 / 臂0=parallel 臂1=parallel | 同上(左臂 J4 朝右, 右臂 J4 朝左) | 与 GET 版**完全同协议同随机化**; 臂0(右, 持刀)换平行爪。平行爪握刀多半会在切削侧向力下打滑/转动——示教中自然补偿即可(与挂杯同款力学对照证据), 但每条必须真切断 |
+| 抽屉分类整理(单臂) | `put the blocks in the top drawer and the other objects in the third drawer` | 右臂单臂 / GET & parallel(同 prompt, 跨爪A/B) | **右臂 J4 朝右(+90°)** | 规则固定: 积木→顶层, 其他物体→第三层; **所有抽屉把手贴同款黑胶带**(每层都贴, 只助定位不编码目标层, 部署必须在位); 初始状态: 全关为主, ~30-40% 条目预开顶层/第三层/两层(只用全开或全关, 不半开); 终态: 所有抽屉关闭 + 桌面清空(进度可见性); 每条 2 块积木 + 1-2 其他物体(控制在 ~80s); 其他物体逐条轮换, 保留物体不上桌(零样本); 柜子 yaw ±10°/位置 ±5cm(两极端朝向先做限位验证) |
 | 切橡皮泥(旧换手, 已停采) | `regrasp the knife and cut the play-dough` | 双臂 / 同上 | 同上(历史数据) | 旧摩擦握法+换手; 仅作 ablation, 不再采集 |
 | 扫物入铲(双工具) | `sweep the objects into the dustpan` | 双臂 / 臂0(右)=GET 持扫帚(圆柄需形封闭), 臂1(左)=parallel 持铲(扁柄面接触) | **左臂 J4 朝左, 右臂 J4 朝右(双外向; 与切泥双内向相反, 肘部撤出中央扫动走廊)——录前四角限位验证** | 物体【逐条轮换】(乐高/豆子/螺栓/纸团等, 动力学各异); **保留物体(骰子、橡皮等)零样本评测用, 采集期一律不上桌**; 乐高堆位置/铲位随机; 扫帚抓法朝向+握持高度: 滑移测试后锁死(TODO) |
 | 积木入碗 | `pick up blocks and place them in the bowl` | 单臂 | TODO(回忆后补) | |

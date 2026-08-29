@@ -176,6 +176,11 @@ class AirbotEEFInputs(transforms.DataTransformFn):
             inputs["actions"] = data["actions"]
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
+        # force-aware Level A: 未来 chunk 力矩目标 + 有无遥测标记(仅训练数据有; 部署无此键)
+        if data.get("observation/effort") is not None:
+            inputs["effort"] = np.asarray(data["observation/effort"], np.float32)
+            inputs["effort_mask"] = np.asarray(
+                data.get("observation/effort_mask", 1.0), np.float32).reshape(1)
         return inputs
 
 

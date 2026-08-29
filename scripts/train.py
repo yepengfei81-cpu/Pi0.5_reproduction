@@ -147,15 +147,17 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        aux = {}
+        chunked_loss = model.compute_loss(rng, observation, actions, train=True, aux=aux)
+        return jnp.mean(chunked_loss), aux
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, aux), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions)
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -196,6 +198,9 @@ def train_step(
         # FiLM 投影单独监控: 从0涨并保持=通道被使用; 回落向0=在被关闭。无 film 配置=0。
         "gripper_film_norm": optax.global_norm(
             nnx.state(model, nnx.All(nnx.Param, nnx_utils.PathRegex(".*film.*")))),
+        # force-aware: 动作 loss 与力矩辅助 loss 分开看(无 effort 配置时 effort_loss=0)
+        "action_loss": aux.get("action_loss", loss),
+        "effort_loss": aux.get("effort_loss", jnp.zeros(())),
     }
     return new_state, info
 
@@ -231,11 +236,14 @@ def probe_step(
 
     # clean_loss: 关遮断+关图像增强+固定噪声种子的"干净拟合度"。训练 loss 因遮断而抬高
     # (盲样本有不可约歧义), 跨运行不可比; 这个数才可比——它回答"全相机在位时拟合得好不好"。
-    clean_loss = jnp.mean(model.compute_loss(jax.random.key(2), obs, actions, train=False))
+    clean_aux = {}
+    model.compute_loss(jax.random.key(2), obs, actions, train=False, aux=clean_aux)
+    clean_loss = clean_aux["action_loss"]            # 只取动作项, 与无 effort 头的历史运行可比
 
     floor = d(a, a_alt)
     return {
         "probe/clean_loss": clean_loss,
+        "probe/clean_effort_loss": clean_aux.get("effort_loss", jnp.zeros(())),
         "probe/noise_floor": floor,
         "probe/zero_dact": d(a, a_zero),
         "probe/roll_dact": d(a, a_roll),

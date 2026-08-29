@@ -42,6 +42,55 @@ TARGET_FPS = 10                  # 统一帧率(遥操作 10Hz)
 CHUNK = 1000                     # LeRobot chunks_size(与模板一致)
 VIDEO_KEYS = ("image", "wrist_image", "wrist_image_1")
 N_IMG_STAT_FRAMES = 10           # 图像 stats 采样帧数(仅元数据, 训练不使用图像stats)
+EFFORT_DIM = 14                  # force-aware: [tau0(6), grip_tau0, tau1(6), grip_tau1]; 单臂臂1=0
+
+
+# ---------------------------------------------------------------------------
+# force-aware(Level A): 100Hz 遥测 sidecar -> 逐帧力矩 (n, 14) + 有无遥测标记
+# ---------------------------------------------------------------------------
+def load_effort(root, stem, n, dual):
+    """<root>/telemetry/<stem>.npz -> (effort (n,14) float32, mask 1.0/0.0)。
+    对齐: 遥测行 frame_idx=k+1 落在第 k 帧采集之后的 0.1s 内 -> 该帧的力矩 = 这些行的均值。
+    无遥测(老数据)-> 全零 + mask=0(训练时该样本的力矩 loss 被屏蔽)。"""
+    f = root / "telemetry" / f"{stem}.npz"
+    if not f.exists():
+        return np.zeros((n, EFFORT_DIM), np.float32), 0.0
+    z = np.load(f)
+    def cols(sfx):
+        return np.concatenate([np.asarray(z[f"tau{sfx}"], np.float64),
+                               np.asarray(z[f"grip_tau{sfx}"], np.float64)[:, None]], axis=1)
+    raw = (np.concatenate([cols("_0"), cols("_1")], axis=1) if dual
+           else np.concatenate([cols(""), np.zeros((len(z["t"]), 7))], axis=1))
+    fi = np.asarray(z["frame_idx"]).astype(int) - 1          # 行 k+1 -> 帧 k
+    ok = (fi >= 0) & (fi < n) & ~np.isnan(raw).any(1)
+    out = np.zeros((n, EFFORT_DIM)); cnt = np.zeros(n)
+    np.add.at(out, fi[ok], raw[ok]); np.add.at(cnt, fi[ok], 1)
+    have = cnt > 0
+    if not have.any():
+        return np.zeros((n, EFFORT_DIM), np.float32), 0.0
+    out[have] /= cnt[have, None]
+    if (~have).any():                                          # 极少数空帧: 取最近有值帧
+        src = np.flatnonzero(have); dst = np.flatnonzero(~have)
+        out[dst] = out[src[np.abs(src[None, :] - dst[:, None]).argmin(1)]]
+    return out.astype(np.float32), 1.0
+
+
+def extend_schema_with_effort(schema):
+    """给模板 schema 加 effort(fixed_size_list<float>[14]) + effort_mask(float),
+    并同步 parquet 内嵌的 HF features 元数据(否则服务器端 datasets 解析不到新列)。"""
+    import pyarrow as pa
+    if "effort" in schema.names:
+        return schema
+    md = dict(schema.metadata or {})
+    hf = json.loads(md[b"huggingface"]) if b"huggingface" in md else {"info": {"features": {}}}
+    feats = hf.setdefault("info", {}).setdefault("features", {})
+    feats["effort"] = {"feature": {"dtype": "float32", "_type": "Value"},
+                       "length": EFFORT_DIM, "_type": "Sequence"}
+    feats["effort_mask"] = {"dtype": "float32", "_type": "Value"}
+    md[b"huggingface"] = json.dumps(hf).encode()
+    schema = schema.append(pa.field("effort", pa.list_(pa.float32(), EFFORT_DIM)))
+    schema = schema.append(pa.field("effort_mask", pa.float32()))
+    return schema.with_metadata(md)
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +335,8 @@ def write_parquet(path, tmpl_schema, ep_idx, task_idx, start_index, rows):
         "episode_index": np.full(n, ep_idx, np.int64),
         "index": np.arange(start_index, start_index + n, dtype=np.int64),
         "task_index": np.full(n, task_idx, np.int64),
+        "effort": rows["effort"],
+        "effort_mask": np.full(n, rows["effort_mask"], np.float32),
     }
     arrays = []
     for f in tmpl_schema:
@@ -304,7 +355,8 @@ def episode_stats_row(ep_idx, cols, img_stats):
     st = {k: img_stats[k] for k in VIDEO_KEYS}
     st["state"] = vec_stats(cols["state"]); st["actions"] = vec_stats(cols["actions"])
     for k in ("env_mask", "arm1_mask", "gripper_id_0", "gripper_id_1",
-              "timestamp", "frame_index", "episode_index", "index", "task_index"):
+              "timestamp", "frame_index", "episode_index", "index", "task_index",
+              "effort", "effort_mask"):
         st[k] = vec_stats(cols[k])
     return {"episode_index": ep_idx, "stats": st}
 
@@ -318,7 +370,9 @@ def main():
     ap.add_argument("--teleop-gripper", nargs="+", default=["parallel"])
     ap.add_argument("--teleop-task", default=None, help="覆盖 prompt; 默认读各源 tasks.jsonl")
     ap.add_argument("--dualarm-dir", nargs="+", default=[])
-    ap.add_argument("--dualarm-gripper", nargs=2, default=["get", "parallel"])
+    ap.add_argument("--dualarm-gripper", nargs="+", default=["get", "parallel"],
+                    help="双臂 (臂0 臂1) 爪名: 给 2 个=广播到所有 --dualarm-dir; 或给 2xN 个=逐目录成对 "
+                         "(如 'get parallel get parallel parallel parallel' 对应 3 个目录)")
     ap.add_argument("--dualarm-task", default=None)
     ap.add_argument("--dualarm-repeat", type=int, default=1)
     ap.add_argument("--gripper-names", nargs="+", default=["parallel", "get"])
@@ -350,6 +404,8 @@ def main():
               f"输出只含新增 episode, 需 rsync 合并进服务器全集")
         tmpl_schema = pq.read_schema(sorted(ledger.glob("schema_*.parquet"))[0])
         tmpl_info = json.loads((ledger / "info.json").read_text(encoding="utf-8"))
+        if "effort" not in tmpl_schema.names:
+            sys.exit("账本 schema 无 effort 列(旧版打包); force-aware 列不能混入旧集, 请全量重建到新 repo_id")
     else:
         tmpl_root = out if args.append else Path(args.template).expanduser().resolve()
         tmpl_pq = sorted((tmpl_root / "data").rglob("episode_*.parquet"))
@@ -358,6 +414,12 @@ def main():
                      f"; 若是 --append 且产物已删, 账本 {ledger} 也不存在)")
         tmpl_schema = pq.read_schema(tmpl_pq[0])
         tmpl_info = json.loads((tmpl_root / "meta" / "info.json").read_text(encoding="utf-8"))
+        if args.append and "effort" not in tmpl_schema.names:
+            sys.exit("现有打包集无 effort 列(旧版打包); 不能追加混用, 请全量重建到新 repo_id")
+    tmpl_schema = extend_schema_with_effort(tmpl_schema)
+    tmpl_info.setdefault("features", {})
+    tmpl_info["features"]["effort"] = {"dtype": "float32", "shape": [EFFORT_DIM], "names": ["effort"]}
+    tmpl_info["features"]["effort_mask"] = {"dtype": "float32", "shape": [1], "names": ["effort_mask"]}
 
     name_to_id = {n: i for i, n in enumerate(args.gripper_names)}
 
@@ -441,6 +503,7 @@ def main():
         nonlocal ep_idx, g_index
         rows["gid0"], rows["gid1"] = gid0, gid1
         rows["state"] = rows["state"][:n]; rows["actions"] = rows["actions"][:n]
+        rows["effort"] = rows["effort"][:n]
         pq_dir = out / "data" / f"chunk-{ep_idx // CHUNK:03d}"
         pq_dir.mkdir(parents=True, exist_ok=True)
         cols = write_parquet(pq_dir / f"episode_{ep_idx:06d}.parquet",
@@ -461,7 +524,7 @@ def main():
         manifest["entries"][key_id] = {"out_index": ep_idx, "task": task, "n": n}
         ep_idx += 1; g_index += n
 
-    n_new = n_skip = 0
+    n_new = n_skip = n_eff = 0
 
     # ---- 单臂遥操作 ----
     tg = args.teleop_gripper if len(args.teleop_gripper) != 1 else args.teleop_gripper * len(args.teleop_dir)
@@ -490,17 +553,25 @@ def main():
             task = args.teleop_task or src_tasks.get(rows["task_index"])
             if task is None:
                 print(f"  ✗ {pqf.stem}: 无 task, 跳过"); continue
+            rows["effort"], rows["effort_mask"] = load_effort(troot, pqf.stem, n, dual=False)
+            n_eff += int(rows["effort_mask"] > 0)
             emit(rows, n, task, gid, 0, vids, key_id)
             n_new += 1
 
     # ---- 双臂 ----
-    gp0, gp1 = gparams(args.dualarm_gripper[0]), gparams(args.dualarm_gripper[1])
-    gid0, gid1 = name_to_id[args.dualarm_gripper[0]], name_to_id[args.dualarm_gripper[1]]
-    for d in args.dualarm_dir:
+    dg = list(args.dualarm_gripper)
+    if len(dg) == 2:
+        dg = dg * len(args.dualarm_dir)                       # 广播
+    if args.dualarm_dir and len(dg) != 2 * len(args.dualarm_dir):
+        sys.exit(f"--dualarm-gripper 须为 2 个(广播)或 2x目录数({2*len(args.dualarm_dir)})个, 现 {len(dg)} 个")
+    for di, d in enumerate(args.dualarm_dir):
+        g0n, g1n = dg[2 * di], dg[2 * di + 1]
+        gp0, gp1 = gparams(g0n), gparams(g1n)
+        gid0, gid1 = name_to_id[g0n], name_to_id[g1n]
         droot = Path(d).expanduser().resolve()
         src_tasks = load_source_tasks(droot)
         pqs = sorted((droot / "data").rglob("episode_*.parquet"))[: args.limit or None]
-        print(f"[双臂 {droot.name}] {len(pqs)} 条")
+        print(f"[双臂 {droot.name}] {len(pqs)} 条 臂0={g0n} 臂1={g1n}")
         for pqf in pqs:
             sub = pqf.parent.name
             vids = {k: droot / "videos" / sub / k / f"{pqf.stem}.mp4" for k in VIDEO_KEYS}
@@ -515,6 +586,8 @@ def main():
             task = args.dualarm_task or src_tasks.get(rows["task_index"])
             if task is None:
                 print(f"  ✗ {pqf.stem}: 无 task, 跳过"); continue
+            rows["effort"], rows["effort_mask"] = load_effort(droot, pqf.stem, n, dual=True)
+            n_eff += int(rows["effort_mask"] > 0)
             for r in range(max(1, args.dualarm_repeat)):
                 key_id = f"{droot}::{pqf.stem}::{r}"
                 if key_id in done:
@@ -546,6 +619,7 @@ def main():
 
     print(f"\n===== pack v2 完成 =====")
     print(f"  新打包 {n_new} 条(跳过已有 {n_skip}), 总计 {ep_idx} 条 / {g_index} 帧")
+    print(f"  其中带力矩遥测(effort_mask=1): {n_eff} 条 (其余 effort=0, 训练时屏蔽)")
     print(f"  输出: {out}")
     if delta:
         print("  ⚠ delta 续打: 上面的'总计'是全集逻辑规模; 本目录只含新增 episode + 完整 meta,")

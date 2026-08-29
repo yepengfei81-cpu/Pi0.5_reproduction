@@ -105,6 +105,11 @@ def main(config_name: str, max_frames: int | None = None):
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
         for key in keys:
             stats[key].update(np.asarray(batch[key]))
+        # force-aware: effort 只用有遥测的样本统计(无遥测样本是全零占位, 会污染均值/方差)
+        if "effort" in batch:
+            m = np.asarray(batch["effort_mask"]).reshape(-1) > 0.5
+            if m.any():
+                stats.setdefault("effort", normalize.RunningStats()).update(np.asarray(batch["effort"])[m])
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 

@@ -151,6 +151,12 @@ class Pi0(_model.BaseModel):
         cd = tuple(config.cam_dropout) + (0.0,) * 3   # 兼容 2 元组旧写法
         assert sum(cd[:3]) <= 1.0, "cam_dropout 概率之和须<=1(互斥分段)"
         self.cam_dropout = cd[:3]
+        # force-aware Level A: 力矩前向预测头, 与 action_out_proj 平行(同一份 suffix 特征)。
+        # 命名含 effort => 权重加载白名单 .*(lora|gripper|effort).* 覆盖; 不在 llm 下 => 可训练。
+        self.effort_dim = int(config.effort_dim)
+        self.effort_loss_weight = float(config.effort_loss_weight)
+        if self.effort_dim > 0:
+            self.effort_head = nnx.Linear(action_expert_config.width, self.effort_dim, rngs=rngs)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -300,7 +306,8 @@ class Pi0(_model.BaseModel):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False,
+        aux: dict | None = None,
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, drop_rng, noise_rng, time_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
@@ -326,7 +333,28 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        action_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)                    # (b, ah)
+        total = action_loss
+        # force-aware Level A: 动作条件化前向预测——同一份 suffix 特征(含带噪动作+时间步)
+        # 预测未来 chunk 的力矩; 按 effort_mask(无遥测样本) 与 arm1_mask(单臂样本的臂1 7维) 屏蔽。
+        if self.effort_dim > 0 and observation.effort is not None:
+            pred = self.effort_head(suffix_out[:, -self.action_horizon :])          # (b, ah, d)
+            b = pred.shape[0]
+            m = jnp.ones((b, 1, self.effort_dim), pred.dtype)
+            if observation.effort_mask is not None:
+                m = m * jnp.asarray(observation.effort_mask, pred.dtype).reshape((b, 1, 1))
+            if observation.arm1_mask is not None and self.effort_dim == 14:
+                am = (jnp.asarray(observation.arm1_mask).reshape((b, 1, 1)) > 0.5).astype(pred.dtype)
+                m = m * jnp.concatenate(
+                    [jnp.ones((b, 1, 7), pred.dtype), jnp.broadcast_to(am, (b, 1, 7))], axis=-1)
+            sq = jnp.square(pred - jnp.asarray(observation.effort, pred.dtype)) * m  # (b, ah, d)
+            per_t = sq.sum(-1) / jnp.maximum(m.sum(-1), 1.0)                       # (b, ah)
+            total = action_loss + self.effort_loss_weight * per_t
+            if aux is not None:
+                aux["effort_loss"] = sq.sum() / jnp.maximum(m.sum() * pred.shape[1], 1.0)
+        if aux is not None:
+            aux["action_loss"] = jnp.mean(action_loss)
+        return total
 
     @override
     def sample_actions(

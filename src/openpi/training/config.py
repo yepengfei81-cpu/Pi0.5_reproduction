@@ -355,6 +355,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            action_sequence_keys=("actions", "effort") if self.effort else ("actions",),
         )
 
 @dataclasses.dataclass(frozen=True)
@@ -398,6 +399,7 @@ class LeRobotAirbotPlayDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            action_sequence_keys=("actions", "effort") if self.effort else ("actions",),
         )
 
 
@@ -428,6 +430,9 @@ class LeRobotAirbotEEFDataConfig(DataConfigFactory):
     # 于是"指尖伸多远"只能从点云读 -> 每帧稠密梯度压力。同时关闭点云尺度抖动。
     # 数据与默认(指尖锚定)不兼容, 必须配套的 repo_id/norm_stats。
     arm_frame: bool = False
+    # force-aware Level A: 打包列 effort(14D 力矩)/effort_mask 进管线, effort 经 delta_timestamps
+    # 取成未来 chunk (H,14) 作为辅助预测目标(模型 effort_dim>0 时生效)。需 pack 含 effort 列。
+    effort: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -448,6 +453,9 @@ class LeRobotAirbotEEFDataConfig(DataConfigFactory):
                 repack_map["observation/gripper_id_1"] = "gripper_id_1"
         elif self.grippers_npz_path is not None:
             repack_map["observation/gripper_id"] = "gripper_id"   # 单臂多爪: 每帧选第几把爪
+        if self.effort:
+            repack_map["observation/effort"] = "effort"            # (H,14) 未来力矩 chunk
+            repack_map["observation/effort_mask"] = "effort_mask"  # 1=有遥测 / 0=老数据(屏蔽)
         repack_transform = _transforms.Group(
             inputs=[_transforms.RepackTransform(repack_map)]
         )
@@ -510,6 +518,7 @@ class LeRobotAirbotEEFDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            action_sequence_keys=("actions", "effort") if self.effort else ("actions",),
         )
 
 
@@ -617,6 +626,7 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            action_sequence_keys=("actions", "effort") if self.effort else ("actions",),
         )
 
 
@@ -1162,6 +1172,53 @@ _CONFIGS = [
             warmup_steps=1_000,
             peak_lr=3.5e-5,
             decay_steps=34_000,
+            decay_lr=3.5e-6,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # 消融梯 f 档(force-aware Level A): armframe_v2 配方 + 力矩前向预测辅助头。
+    # effort 列来自 100Hz 遥测(切泥v2/挂杯/扫地/抽屉 ≈43% 条目有; 其余 mask=0 屏蔽)。
+    # 力矩只当训练目标, 推理零改动; 产出: 接触表征塑形 + 部署监视器(预测 vs 实测失配)。
+    TrainConfig(
+        name="pi05_cotrain_dualarm_effort",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            gripper_token=True,
+            num_gripper_points=256,
+            region_tokens=True,
+            film_geometry=True,
+            cam_dropout=(0.30, 0.10, 0.08),
+            effort_dim=14,
+            effort_loss_weight=0.05,
+        ),
+        data=LeRobotAirbotEEFDataConfig(
+            repo_id="cotrain_dualarm5",
+            grippers_npz_path="gripper_geom/grippers_armframe.npz",
+            gripper_names=("parallel", "get"),
+            num_gripper_points=256,
+            gripper_aug=True,
+            dual=True,
+            region_tokens=True,
+            arm_frame=True,
+            effort=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=48,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=3.5e-5,
+            decay_steps=40_000,
             decay_lr=3.5e-6,
         ),
         freeze_filter=pi0_config.Pi0Config(

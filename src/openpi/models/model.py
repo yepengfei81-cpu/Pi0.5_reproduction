@@ -105,6 +105,9 @@ class Observation(Generic[ArrayT]):
     # 双臂: 臂1 夹爪几何点云 + arm1_mask(1=双臂有效 / 0=单臂 -> 模型屏蔽臂1 token)。
     gripper_pc_1: at.Float[ArrayT, "*b p 3"] | at.Float[ArrayT, "*b r p 3"] | None = None
     arm1_mask: at.Float[ArrayT, "*b 1"] | None = None
+    # force-aware(Level A): 未来 chunk 的力矩目标 (ah, d) + 该样本是否有遥测(1/0)。仅训练时存在。
+    effort: at.Float[ArrayT, "*b ah d"] | None = None
+    effort_mask: at.Float[ArrayT, "*b 1"] | None = None
 
     # pi0-fast model specific fields.
 
@@ -136,6 +139,8 @@ class Observation(Generic[ArrayT]):
             gripper_pc=data.get("gripper_pc"),
             gripper_pc_1=data.get("gripper_pc_1"),
             arm1_mask=data.get("arm1_mask"),
+            effort=data.get("effort"),
+            effort_mask=data.get("effort_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -218,6 +223,8 @@ def preprocess_observation(
         gripper_pc=observation.gripper_pc,
         gripper_pc_1=observation.gripper_pc_1,
         arm1_mask=observation.arm1_mask,
+        effort=observation.effort,
+        effort_mask=observation.effort_mask,
     )
 
 
