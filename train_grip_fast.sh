@@ -48,7 +48,7 @@ fi
 
 set -e
 # save-interval=5000 是抢占保险(gpu_requeue), 不能去; keep-period=None + orbax
-# max_to_keep=1 => 任意时刻只留最新一档滚动, 训完只剩终档(33999), 不再攒 10000 的倍数。
+# max_to_keep=1 => 任意时刻只留最新一档滚动, 训完只剩终档(39999), 不再攒 10000 的倍数。
 uv run --no-sync scripts/train.py $CONFIG \
   --exp-name=armframe_v3 $MODE \
   --save-interval=5000 \

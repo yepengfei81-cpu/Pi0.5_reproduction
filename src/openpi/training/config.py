@@ -1263,13 +1263,13 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=34_000,
+        num_train_steps=40_000,
         batch_size=48,
         num_workers=8,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=3.5e-5,
-            decay_steps=34_000,
+            decay_steps=40_000,
             decay_lr=3.5e-6,
         ),
         freeze_filter=pi0_config.Pi0Config(
