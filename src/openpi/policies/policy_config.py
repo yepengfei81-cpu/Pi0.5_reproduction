@@ -12,6 +12,9 @@ from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
 import openpi.transforms as transforms
 
+# 训练时才存在的辅助预测目标(有 norm_stats 但推理不输出), 反归一化时跳过
+_AUX_TARGET_KEYS = frozenset({"effort"})
+
 
 def create_trained_policy(
     train_config: _config.TrainConfig,
@@ -83,7 +86,13 @@ def create_trained_policy(
         ],
         output_transforms=[
             *data_config.model_transforms.outputs,
-            transforms.Unnormalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+            # 输出侧只反归一化模型真正输出的键。训练专用的辅助目标(如 force-aware 的
+            # effort)也在 norm_stats 里, 但推理不产出它——Unnormalize 是严格模式, 留着会报
+            # "Selector key effort not found"。
+            transforms.Unnormalize(
+                None if norm_stats is None
+                else {k: v for k, v in norm_stats.items() if k not in _AUX_TARGET_KEYS},
+                use_quantiles=data_config.use_quantile_norm),
             *data_config.data_transforms.outputs,
             *repack_transforms.outputs,
         ],

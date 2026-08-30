@@ -1252,7 +1252,7 @@ _CONFIGS = [
             cam_dropout=(0.30, 0.10, 0.08),
         ),
         data=LeRobotAirbotEEFDataConfig(
-            repo_id="cotrain_dualarm4",
+            repo_id="cotrain_dualarm5",   # 700 条含抽屉; 多出的 effort 列被 repack 忽略
             grippers_npz_path="gripper_geom/grippers_armframe.npz",
             gripper_names=("parallel", "get"),
             num_gripper_points=256,
