@@ -149,6 +149,7 @@ class EEFRunner:
         self.dry_run = a.dry_run
         self.show = not a.no_display
         self.start_from_lead = a.start_from_lead
+        self.log_joints = a.log_joints
         self.lead_ports = (a.lead_port0, a.lead_port1)
         self.board_z = board_z; self.press = a.press; self.z_offset = a.start_z_offset
         self._stop = False
@@ -407,6 +408,21 @@ class EEFRunner:
                 if a_w is None:
                     break
                 p0, q0, g0 = self.arm0.action_to_base(a_w[:10])
+                # 诊断: 指令层面的【跳变】= 相邻两拍位移量突变(加速度尖峰), 不是速度快。
+                # 搬运段 15-20mm/拍 是正常速度, 不报; 一拍位移比上一拍突然多/少 >12mm 才报。
+                _d = float(np.linalg.norm(p0 - self.arm0.last_p)) if self.arm0.last_p is not None else 0.0
+                _prev_d = getattr(self, "_prev_d0", _d)
+                _gjump = abs(g0 - self._last_g0) if hasattr(self, "_last_g0") else 0.0
+                if abs(_d - _prev_d) > 0.012 or _gjump > 0.2 or _d > self.max_step_m:
+                    print(f"    ⚡ [macro {macro}] 指令跳变: 本拍位移 {_d*1000:.0f}mm (上拍 {_prev_d*1000:.0f}mm)"
+                          f"{' -> 夹到30mm' if _d > self.max_step_m else ''}  夹爪 Δ{_gjump:.2f}", flush=True)
+                self._prev_d0 = _d; self._last_g0 = g0
+                if self.log_joints and macro % self.chunk_execute == 0:   # 关节角(deg), 查是否逼近限位
+                    try:
+                        _q = self.arm0.h._robot.get_joint_pos()
+                        print("    关节(deg): " + " ".join(f"J{i+1}={np.degrees(v):+.0f}" for i, v in enumerate(_q)), flush=True)
+                    except Exception:
+                        pass
                 p0 = self._clamp_step(self.arm0, p0)
                 tgt1 = None
                 if self.arm1 is not None:
@@ -532,6 +548,8 @@ def main():
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--timeout", type=float, default=None)
     ap.add_argument("--dry-run", action="store_true", help="只推理+打印, 不发运动")
+    ap.add_argument("--log-joints", action="store_true",
+                    help="每个 chunk 打印一次臂0关节角(deg), 用于核对抽动是否发生在逼近关节限位时")
     ap.add_argument("--no-display", action="store_true")
     args = ap.parse_args()
 

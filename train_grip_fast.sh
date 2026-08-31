@@ -33,7 +33,7 @@ done
 echo ">>> Ready ($(date)), starting training"
 
 # Preemption-safe: if a previous (preempted) run left checkpoints, resume from them;
-# otherwise start fresh. Combined with --save-interval=5000, a preemption costs at
+# otherwise start fresh. Combined with --save-interval=2000, a preemption costs at
 # most ~5000 steps of progress and the job auto-requeues and continues.
 # 只认"纯数字步数目录"= 真 checkpoint; wandb_id.txt/orbax 脚手架(首次尝试被抢占
 # 时会留下)不算, 否则空跑一轮也会误报 resuming(openpi 内部虽会兜底转 fresh,
@@ -47,9 +47,9 @@ else
 fi
 
 set -e
-# save-interval=5000 是抢占保险(gpu_requeue), 不能去; keep-period=None + orbax
+# save-interval=2000 是抢占保险(gpu_requeue), 不能去; keep-period=None + orbax
 # max_to_keep=1 => 任意时刻只留最新一档滚动, 训完只剩终档(39999), 不再攒 10000 的倍数。
 uv run --no-sync scripts/train.py $CONFIG \
   --exp-name=armframe_v3 $MODE \
-  --save-interval=5000 \
+  --save-interval=2000 \
   --keep-period=None
