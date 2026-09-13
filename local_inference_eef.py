@@ -46,6 +46,7 @@ sys.path.insert(0, str(_ROOT / "umi"))
 sys.path.insert(0, str(_ROOT / "gripper_geom"))
 from collect_data import DualCamera  # noqa: E402  color-only 相机(并行启动, 带宽减半)
 from gripper_params import get_params  # noqa: E402  每爪开合范围 + 指尖偏移 + board_z
+from joint_guard import JointGuard  # noqa: E402  关节逼近限位提示
 from play_sdk import PlayRealRobot, RobotMode  # noqa: E402
 from umi_to_lerobot import quat_to_rot, rot6d_to_rot, rot_to_6d  # noqa: E402
 from replay_check import rot_to_quat_xyzw, to_base_frame, base_to_wprime  # noqa: E402
@@ -150,6 +151,7 @@ class EEFRunner:
         self.show = not a.no_display
         self.start_from_lead = a.start_from_lead
         self.log_joints = a.log_joints
+        self._jguards = {}
         self.lead_ports = (a.lead_port0, a.lead_port1)
         self.board_z = board_z; self.press = a.press; self.z_offset = a.start_z_offset
         self._stop = False
@@ -417,12 +419,19 @@ class EEFRunner:
                     print(f"    ⚡ [macro {macro}] 指令跳变: 本拍位移 {_d*1000:.0f}mm (上拍 {_prev_d*1000:.0f}mm)"
                           f"{' -> 夹到30mm' if _d > self.max_step_m else ''}  夹爪 Δ{_gjump:.2f}", flush=True)
                 self._prev_d0 = _d; self._last_g0 = g0
-                if self.log_joints and macro % self.chunk_execute == 0:   # 关节角(deg), 查是否逼近限位
-                    try:
-                        _q = self.arm0.h._robot.get_joint_pos()
-                        print("    关节(deg): " + " ".join(f"J{i+1}={np.degrees(v):+.0f}" for i, v in enumerate(_q)), flush=True)
-                    except Exception:
-                        pass
+                if self.log_joints:   # 关节守卫: 每拍查关节余量, 逼近限位即报; 每个 chunk 打印一次臂0关节角
+                    for _k, _arm in enumerate(self._arms()):
+                        try:
+                            _q = _arm.h._robot.get_joint_pos()
+                        except Exception:
+                            _q = None
+                        if not _q:
+                            continue
+                        _g = self._jguards.setdefault(
+                            _k, JointGuard(f"臂{_k}", rate_hz=10, log=lambda m: print(m, flush=True)))
+                        _g.update(_q)
+                        if _k == 0 and macro % self.chunk_execute == 0:
+                            print("    关节(deg): " + " ".join(f"J{i+1}={np.degrees(v):+.0f}" for i, v in enumerate(_q)), flush=True)
                 p0 = self._clamp_step(self.arm0, p0)
                 tgt1 = None
                 if self.arm1 is not None:
@@ -446,6 +455,8 @@ class EEFRunner:
         except KeyboardInterrupt:
             logger.info("Ctrl+C 中断")
         finally:
+            for _g in self._jguards.values():
+                print(">>> " + _g.summary(), flush=True)
             self.shutdown()
 
     def shutdown(self):
@@ -549,7 +560,8 @@ def main():
     ap.add_argument("--timeout", type=float, default=None)
     ap.add_argument("--dry-run", action="store_true", help="只推理+打印, 不发运动")
     ap.add_argument("--log-joints", action="store_true",
-                    help="每个 chunk 打印一次臂0关节角(deg), 用于核对抽动是否发生在逼近关节限位时")
+                    help="关节守卫: 关节距限位 <15° 提示、<5° 报危险(时刻以 macro/10 秒计); 每个 chunk 打印一次臂0关节角; "
+                         "结束时打印本次最贴限位的关节。用于核对抽动是否发生在逼近关节限位时")
     ap.add_argument("--no-display", action="store_true")
     args = ap.parse_args()
 

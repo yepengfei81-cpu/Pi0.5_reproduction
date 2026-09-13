@@ -34,6 +34,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gripper_geom"))
 from gripper_params import get_params  # noqa: E402  每爪开合范围
+from joint_guard import JointGuard  # noqa: E402  关节逼近限位/跟随卡住提示
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -85,6 +86,9 @@ def parse_args():
                              "存 <数据集>/telemetry/episode_XXXXXX.npz, 供 NeuralActuator 力估计等使用; "
                              "0=关闭。若遥操作跟手性变差, 降到 50")
     # ===== 双臂模式 =====
+    parser.add_argument("--joint-margin", type=float, default=15.0,
+                        help="关节守卫: lead 指令距 follow 限位小于该角度(°)时终端提示, <5° 报危险; "
+                             "follow 跟不上 lead >12° 持续 0.3s 也报。每条录完打印最贴限位的关节。0=关闭")
     parser.add_argument("--dual-arm", action="store_true",
                         help="双臂采集: 两对 lead-follow + 环境相机 + 两个手眼; 输出 state_eef_0/1 + wrist_image_1")
     parser.add_argument("--lead-port1", type=int, default=50053, help="[双臂] 臂1 lead 端口")
@@ -250,7 +254,7 @@ def reset_to_home(follow):
 
 
 def collect_episode(lead, follow, cameras, record_freq, control_freq,
-                    episode_num, show_display, telemetry_hz=0):
+                    episode_num, show_display, telemetry_hz=0, joint_margin=15.0):
     """
     录制一条 episode。
     返回: (frames, telem) 或 None（丢弃）。frames=[{state, action, ...}];
@@ -294,6 +298,8 @@ def collect_episode(lead, follow, cameras, record_freq, control_freq,
                               "q", "dq", "tau", "grip_q", "grip_tau")}
              if telem_interval else None)
     t_ep0 = time.monotonic()
+    guard = (JointGuard("follow", margin_deg=joint_margin, rate_hz=record_freq, log=logger.warning)
+             if joint_margin > 0 else None)
 
     logger.info("录制中... 按 Enter 结束并保存")
 
@@ -334,6 +340,8 @@ def collect_episode(lead, follow, cameras, record_freq, control_freq,
             if step % record_interval == 0:
                 follow_joints = follow.get_joint_pos()
                 follow_eef = follow.get_eef_pos()
+                if guard is not None:
+                    guard.update(lead_joints, follow_joints)
                 # 在线厂家 FK：base 系末端位姿 [[x,y,z],[qx,qy,qz,qw]]
                 follow_pose = follow.get_end_pose()   # state = 当前(follow)末端
                 lead_pose = lead.get_end_pose()        # action = 目标(lead)末端
@@ -403,6 +411,8 @@ def collect_episode(lead, follow, cameras, record_freq, control_freq,
         logger.warning("帧数太少，丢弃")
         return None
 
+    if guard is not None:
+        logger.info(guard.summary())
     resp = input("保存本条? [Enter=保存, d=丢弃]: ").strip().lower()
     if resp == "d":
         logger.info("已丢弃")
@@ -514,7 +524,7 @@ def show_camera_view_dual(head, w0, w1, ep, fc, freq):
 
 
 def collect_episode_dual(arms, cameras, record_freq, control_freq, episode_num, show_display,
-                         telemetry_hz=0):
+                         telemetry_hz=0, joint_margin=15.0):
     """双臂录制。arms=[(lead,follow,fmin,fmax), ...]。返回 (frames, telem) 或 None。
     每帧: head_rgb + wrist_rgb_0/1 + state_eef_0/1(follow实际) + action_eef_0/1(lead指令)。
     telem = 遥测 sidecar(字段带 _0/_1 后缀) 或 None。"""
@@ -542,6 +552,8 @@ def collect_episode_dual(arms, cameras, record_freq, control_freq, episode_num, 
                  for n in ("cmd_q", "cmd_grip", "q", "dq", "tau", "grip_q", "grip_tau")]}
              if telem_interval else None)
     t_ep0 = time.monotonic()
+    guards = ([JointGuard(f"臂{ai}", margin_deg=joint_margin, rate_hz=record_freq, log=logger.warning)
+               for ai in range(len(arms))] if joint_margin > 0 else None)
     logger.info("录制中... 按 Enter 结束并保存")
     try:
         while recording:
@@ -573,6 +585,9 @@ def collect_episode_dual(arms, cameras, record_freq, control_freq, episode_num, 
                     telem[f"grip_tau_{ai}"].append(_gt[0] if _gt else float("nan"))
 
             if step % record_interval == 0:
+                if guards is not None:
+                    for ai, (_lead, follow, _fm, _fx) in enumerate(arms):
+                        guards[ai].update(cmd_qs[ai], follow.get_joint_pos())
                 recs = []; ok = True
                 for ai, (lead, follow, _fmin, _fmax) in enumerate(arms):
                     fe = follow.get_eef_pos(); fp = follow.get_end_pose(); lp = lead.get_end_pose()
@@ -608,6 +623,8 @@ def collect_episode_dual(arms, cameras, record_freq, control_freq, episode_num, 
     logger.info(f"录制结束：共 {len(frames)} 帧 ({len(frames)/record_freq:.1f}s)")
     if len(frames) < 5:
         logger.warning("帧数太少，丢弃"); return None
+    for g in guards or ():
+        logger.info(g.summary())
     if input("保存本条? [Enter=保存, d=丢弃]: ").strip().lower() == "d":
         logger.info("已丢弃"); return None
     return frames, telem
@@ -708,7 +725,7 @@ def run_dual(args):
                 break
             ep = collect_episode_dual(arms, cameras, args.record_freq, CONTROL_FREQ,
                                       num_saved + 1, show_display,
-                                      telemetry_hz=args.telemetry_hz)
+                                      telemetry_hz=args.telemetry_hz, joint_margin=args.joint_margin)
             if ep is not None:
                 frames, telem = ep
                 if dataset is None:
@@ -815,6 +832,7 @@ def main():
                 episode_num=num_saved + 1,
                 show_display=show_display,
                 telemetry_hz=args.telemetry_hz,
+                joint_margin=args.joint_margin,
             )
             if episode is not None:
                 frames, telem = episode
