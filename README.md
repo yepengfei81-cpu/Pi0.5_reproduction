@@ -1,75 +1,181 @@
-# AirBot Play × openpi (π0.5): Reproduction & Deployment Guide
+# π0.5 on AIRBOT Play: End-Effector-Space Training and Deployment
 
-This repo reproduces the **π0.5 (pi05)** vision-language-action model from
-[openpi](https://github.com/Physical-Intelligence/openpi) and adapts it to the
-**AIRBOT Play** arm. It covers two end-to-end pipelines:
+This repository fine-tunes [openpi](https://github.com/Physical-Intelligence/openpi)'s
+**π0.5** on teleoperated demonstrations from one or two **AIRBOT Play** arms.
+States and actions are end-effector poses rather than joint angles. The
+repository covers the whole path: data collection, dataset packing, training
+and real-robot deployment.
 
-- **Pipeline A — joint space, single task**: teleop collection → server training → local real-time inference (`local_inference.py`, config `pi05_airbot_play`).
-- **Pipeline B — task space (EEF), UMI + teleop co-training**: convert handheld **UMI** data and AIRBOT teleop data into one shared task-space dataset → co-train → deploy (`local_inference_eef.py`, config `pi05_cotrain_eef`). This is the current focus: injecting new skills (e.g. *wipe the blackboard*, collected cheaply with a handheld UMI gripper) into a robot that is also trained on teleop tasks (e.g. *pick up the block*).
+This page describes what the model is trained on and how to reproduce the
+training.
 
-> 中文版见 [README_zh.md](README_zh.md). Upstream openpi docs: [README_openpi.md](README_openpi.md).
-
----
-
-## 0. Overview
-
-### Two machines, two environments
-| Machine | Env tool | Used for |
-|---|---|---|
-| **Local workstation** (arm + cameras + GPU) | **conda** (one env for everything) | data collection, local inference |
-| **Training server** (big GPU, no arm) | **uv** | training, norm-stats |
-
-The local inference scripts load the openpi model **and** the arm SDK in the
-same process, so one conda env is simplest. The server only trains, so it uses
-openpi's recommended `uv`.
-
-### Hardware (this setup; change the configs if yours differs)
-- **Arms ×2**: Lead (Replay, passive leader, gRPC port `50051`) + Follow (Play, powered follower, port `50050`).
-- **Cameras ×2**: RealSense D405 — head/env SN `230422271972`, wrist/eye-in-hand SN `230422271433`.
-- **GPU**: inference ≥8 GB; LoRA fine-tuning ≥22.5 GB.
-- **OS**: Ubuntu 20.04+.
-
-Camera serials live in [airbot/play_config.json](airbot/play_config.json) and [airbot/collect_data.py](airbot/collect_data.py).
+> 中文版: [README_zh.md](README_zh.md). Upstream openpi documentation: [README_openpi.md](README_openpi.md).
 
 ---
 
-## 1. Arm & camera setup (system level, real-robot side only)
+## 1. What the model is trained on
 
-Proprietary AIRBOT software is **not** in this repo. For Ubuntu + pure-Python use you only need:
+### 1.1 Raw recordings
 
-| File | Purpose |
+Data is collected by teleoperation: a person moves a leader arm and a follower
+arm tracks it. Each episode is recorded at 10 Hz and holds, per frame:
+
+- RGB images, 640×480: an environment camera, the wrist camera of arm 0, and
+  (dual-arm only) the wrist camera of arm 1;
+- the follower's end-effector pose as reported by the arm (`get_end_pose`:
+  position and quaternion in the arm's base frame) and its gripper reading
+  (`get_eef_pos`);
+- the leader's gripper command;
+- the task instruction as text.
+
+The model's proprioceptive input comes entirely from what the arm reports about
+itself: end-effector pose and gripper opening. Joint angles, velocities and
+torques are not model inputs.
+
+### 1.2 State and action: 20-D
+
+Each arm contributes 10 numbers. Arm 0 is the right arm, arm 1 the left.
+
+| Index | Content |
 |---|---|
-| `airbot-configure_5.1.6-1_all.deb` | driver (CAN / udev) |
-| `airbot_py-5.1.6-py3-none-any.whl` | Python SDK |
+| 0–2 | arm 0 position, metres |
+| 3–8 | arm 0 orientation, 6-D (first two columns of the rotation matrix) |
+| 9 | arm 0 gripper opening, 0 = closed, 1 = fully open |
+| 10–19 | arm 1, same layout |
+
+- **Frame.** Poses are expressed in **W′**, a frame fixed per episode and per
+  arm: its origin is the arm's reported end-effector point at the first frame,
+  its z axis is the base z axis (gravity), and it is rotated about z so that the
+  first frame's yaw is zero. Every episode therefore starts at position
+  (0, 0, 0).
+- **Reference point.** The pose is the point the arm reports, with no tool
+  offset added (`--arm-frame` in the packer, `arm_frame=True` in the config).
+- **Gripper.** The reading is normalised as (reading − closed) / (open − closed)
+  and clipped to [0, 1], using the two values stored per gripper in
+  [gripper_geom/gripper_params.py](gripper_geom/gripper_params.py).
+- **State** at frame t is the follower's measured pose and gripper opening.
+- **Action** at frame t has two parts. The pose part is the state at frame t+1,
+  an absolute target in W′, not a delta. The gripper part is the leader's
+  commanded opening, because the measured opening stops at the object's width
+  and cannot express squeezing.
+- **Single-arm episodes** fill arm 1 with a constant rest vector
+  `[0,0,0, 1,0,0, 0,1,0, 0]`, set `arm1_mask = 0` and use a black image for the
+  arm-1 wrist camera.
+
+### 1.3 Packed dataset
+
+The packer writes one LeRobot (v2.1) dataset at 10 fps.
+
+| Column | Shape | Read by training | Meaning |
+|---|---|---|---|
+| `image` | 480×640×3, H.264 | yes | environment camera |
+| `wrist_image` | 480×640×3, H.264 | yes | arm 0 wrist camera |
+| `wrist_image_1` | 480×640×3, H.264 | yes | arm 1 wrist camera (black in single-arm episodes) |
+| `state` | 20 | yes | see 1.2 |
+| `actions` | 20 | yes | see 1.2 |
+| `env_mask` | 1 | yes | 1 if the environment camera is valid |
+| `arm1_mask` | 1 | yes | 1 for dual-arm episodes, 0 for single-arm |
+| `gripper_id_0`, `gripper_id_1` | 1 each | yes | which gripper is mounted on each arm, as an index into `gripper_names` |
+| `task_index` | 1 | yes | selects the text instruction |
+| `effort`, `effort_mask` | 14, 1 | no | motor torque from the telemetry log; this config does not read it |
+| `timestamp`, `frame_index`, `episode_index`, `index` | 1 each | bookkeeping | |
+
+### 1.4 What reaches the model
+
+For every training sample:
+
+- **Images.** The three views are resized with padding to 224×224. The
+  environment camera goes to the `base_0_rgb` slot, the arm-0 wrist camera to
+  `left_wrist_0_rgb` and the arm-1 wrist camera to `right_wrist_0_rgb`. (The
+  slot names come from openpi and do not match left and right here.) The
+  environment slot is masked when `env_mask = 0`, the arm-1 slot when
+  `arm1_mask = 0`.
+- **State.** The 20-D state is normalised with its 1st and 99th percentiles,
+  padded to 32 dimensions and, as in standard π0.5, discretised and written into
+  the text prompt.
+- **Instruction.** The task text, tokenised with the PaliGemma tokenizer
+  (at most 200 tokens).
+- **Gripper point cloud.** For each arm, a fixed point cloud of the mounted
+  gripper, looked up by `gripper_id_0` / `gripper_id_1` in
+  `gripper_geom/grippers_armframe.npz` (see 4.2).
+- **Target.** The next 10 actions (one second), 20-D each, normalised with their
+  1st and 99th percentiles and padded to 32 dimensions.
+
+Our own dataset is not part of this repository. It holds about 10 hours of
+demonstrations, roughly 700 episodes, covering single-arm and dual-arm tabletop
+tasks.
+
+---
+
+## 2. Training settings
+
+The config is `pi05_cotrain_dualarm_armframe` in `src/openpi/training/config.py`.
+
+| Setting | Value |
+|---|---|
+| Base weights | π0.5 base, `gs://openpi-assets/checkpoints/pi05_base/params` (downloaded automatically) |
+| Fine-tuning | LoRA on both Gemma backbones (`gemma_2b_lora`, `gemma_300m_lora`); their non-LoRA weights are frozen by openpi's LoRA freeze filter |
+| Action chunk | 10 steps at 10 Hz |
+| Batch size | 48 |
+| Steps | 40,000 |
+| Learning rate | cosine decay; 1,000 warm-up steps, peak 3.5e-5, final 3.5e-6 |
+| Optimiser | AdamW (β1 0.9, β2 0.95), gradient clipping at norm 1.0 |
+| EMA | off |
+| Normalisation | quantile (1st / 99th percentile) for state and actions |
+| Seed | 42 |
+| Hardware we use | two NVIDIA H200 GPUs |
+
+---
+
+## 3. Setup
+
+### 3.1 Two machines, two environments
+
+| Machine | Environment | Used for |
+|---|---|---|
+| Local workstation (arms, cameras, GPU) | conda, one environment | collection, packing, deployment |
+| Training server (large GPUs, no robot) | uv | norm stats, training |
+
+The deployment script loads the model and the arm SDK in one process, so one
+conda environment is simplest locally. The server only trains.
+
+### 3.2 Hardware used here
+
+- **Arms**: up to two leader-follower pairs. Arm 0 (right): follower on gRPC port
+  `50050`, leader on `50051`. Arm 1 (left): follower `50052`, leader `50053`.
+- **Cameras**: three RealSense D405. Environment `230422271972`, arm-0 wrist
+  `230422271433`, arm-1 wrist `218622271178`. The serials are set in
+  [airbot/collect_data.py](airbot/collect_data.py) and are the defaults of
+  [local_inference_eef.py](local_inference_eef.py).
+- **GPU**: openpi's guidance is ≥ 8 GB for inference and ≥ 22.5 GB for LoRA
+  fine-tuning.
+- **OS**: Ubuntu 20.04 or later.
+
+Keep the cameras and the USB-CAN adapters on separate USB controllers. Camera
+re-enumeration on a shared bus can drop the CAN link.
+
+### 3.3 AIRBOT driver and SDK (robot side only)
+
+The proprietary AIRBOT software is not in this repository. You need:
 
 ```bash
-sudo apt-get install ./airbot-configure_5.1.6-1_all.deb   # driver
-pip install ./airbot_py-5.1.6-py3-none-any.whl            # SDK (into the conda env from §2)
-pip install pyrealsense2                                  # cameras
+sudo apt-get install ./airbot-configure_5.1.6-1_all.deb   # CAN / udev driver
+pip install ./airbot_py-5.1.6-py3-none-any.whl            # Python SDK, into the conda env below
+pip install pyrealsense2
 ```
 
-The arm wrapper [airbot/play_sdk.py](airbot/play_sdk.py) is already in the repo.
-
----
-
-## 2. Local environment (conda) — collection + inference
+### 3.4 Local environment (conda)
 
 ```bash
 git clone --recurse-submodules <repo-url> && cd <repo>
-conda create -n openpi_airbot python=3.11 -y
-conda activate openpi_airbot
-
+conda create -n openpi_airbot python=3.11 -y && conda activate openpi_airbot
 pip install -e packages/openpi-client
 pip install "lerobot @ git+https://github.com/huggingface/lerobot@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5"
 pip install -e .
 pip install ./airbot_py-5.1.6-py3-none-any.whl pyrealsense2
 ```
 
-System NVIDIA driver / CUDA must already work (`nvidia-smi`).
-
----
-
-## 3. Server environment (uv) — training
+### 3.5 Server environment (uv)
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -77,169 +183,170 @@ git clone --recurse-submodules <repo-url> && cd <repo>
 GIT_LFS_SKIP_SMUDGE=1 uv sync
 GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 ```
-All training commands then use `uv run python ...`.
 
-> The server needs `ffmpeg` for video decoding (`apt-get install ffmpeg`); the
-> LeRobot datasets here store cameras as H.264 video.
+The server needs `ffmpeg` to decode the H.264 camera videos.
 
 ---
 
-## 4. Pipeline A — joint space, single task
+## 4. Step by step
 
-State/action = 6 joints + gripper (7D), absolute joint targets.
+Below, `$DATA` is the directory that holds raw recordings and packed datasets.
+
+### 4.1 Collect
 
 ```bash
-# Collect (local)
-python airbot/collect_data.py --task "pick up the block and place it in the bowl"
+# single arm (arm 0); name the gripper that is mounted
+python airbot/collect_data.py --task "hang the mug on the mug tree" \
+  --follow-gripper get --repo-id get_mug_tree --output-dir $DATA/GET/mug_tree_task
 
-# Train (server)
-export HF_LEROBOT_HOME=/path/to/bigdisk/data
-uv run scripts/compute_norm_stats.py --config-name pi05_airbot_play
-uv run scripts/train.py pi05_airbot_play --exp-name=run1 --num-train-steps=30000 --batch-size=8
-
-# Infer (local) — dry-run first
-python local_inference.py --checkpoint ./checkpoints/pi05_airbot_play/run1/30000 \
-  --task "pick up the block and place it in the bowl" --dry-run
+# dual arm
+python airbot/collect_data.py --dual-arm --task "sweep the objects into the dustpan" \
+  --arm0-gripper get --arm1-gripper parallel \
+  --repo-id sweep_objects --output-dir $DATA/GET/sweep_task
 ```
-Safety: `q`/`Esc` (or `q`+Enter with `--no-display`) stops and returns to zero;
-`--min-z` caps the lowest end-effector height.
+
+Gripper names are the keys of `gripper_geom/gripper_params.py` (`parallel` is
+the factory gripper, `get` a second one). The name selects the opening range
+used to map the leader's gripper to the follower's.
+
+The `--task` string becomes the training instruction; use the same string at
+deployment. Because the state holds no joint angles, start all episodes of a
+task from the same arm configuration.
+
+The script also writes a 100 Hz telemetry file per episode (not used by this
+training; `--telemetry-hz 0` turns it off) and warns in the terminal when a
+joint nears its limit.
+
+### 4.2 Gripper files
+
+Training and deployment need two things per gripper:
+
+- **Opening range**: the `close` and `open` values in
+  [gripper_geom/gripper_params.py](gripper_geom/gripper_params.py), which are
+  `get_eef_pos` readings. `airbot/teach_probe.py` steps the gripper and prints
+  the reading.
+- **Point cloud**: `gripper_geom/grippers_armframe.npz`, one entry per gripper
+  name. It is written by
+  `python gripper_geom/align_to_arm_frame.py` from `gripper_geom/grippers.npz`,
+  which is assembled from the per-gripper descriptors that
+  `gripper_geom/build_gripper_descriptor.py` (CAD meshes) and
+  `build_parallel_descriptor.py` (URDF) produce. The assembly step is not
+  scripted in this repository.
+
+The `.npz` files are generated and not in git. They must be present at the same
+path locally and on the server. The order of names must be the same in the
+packer's `--gripper-names` and the config's `gripper_names` (default:
+`parallel get`).
+
+### 4.3 Pack
+
+```bash
+python umi/pack_lerobot_fast.py --arm-frame \
+  --template $DATA/_schema_template \
+  --teleop-dir     $DATA/parallel/mug_tree_task/parallel_mug_tree  $DATA/GET/mug_tree_task/get_mug_tree \
+  --teleop-gripper parallel                                       get \
+  --dualarm-dir     $DATA/GET/sweep_task/sweep_objects \
+  --dualarm-gripper get parallel \
+  --repo-id cotrain_dualarm5 -o $DATA/cotrain_dualarm5 --verify
+```
+
+- `--teleop-dir` lists single-arm recordings and `--teleop-gripper` gives one
+  gripper name per directory. `--dualarm-dir` lists dual-arm recordings and
+  `--dualarm-gripper` gives an (arm 0, arm 1) pair, either one pair for all
+  directories or one pair per directory.
+- `--arm-frame` writes the pose at the arm's reported point (see 1.2). It must
+  be used together with `arm_frame=True` in the config.
+- `--template` is an existing packed 20-D dataset; only its schema is read.
+- Videos are copied without re-encoding.
+
+The packer keeps a small ledger in `$DATA/_pack_ledger/<repo-id>/`, so the
+packed output can be deleted after it is uploaded. To add recordings later:
+
+```bash
+python umi/pack_lerobot_fast.py --arm-frame --append \
+  --teleop-dir $DATA/<new recording> --teleop-gripper <name> \
+  --repo-id cotrain_dualarm5 -o $DATA/cotrain_dualarm5
+```
+
+`--repo-id` is required here because it locates the ledger. If the packed
+output was deleted, this writes only the new episodes plus complete metadata;
+merge them into the server copy with `rsync` (without `--delete`).
+
+### 4.4 Norm stats and training (server)
+
+Copy the packed dataset to the server, then:
+
+```bash
+export HF_LEROBOT_HOME=/path/to/packed/datasets      # the directory containing cotrain_dualarm5/
+uv run scripts/compute_norm_stats.py --config-name pi05_cotrain_dualarm_armframe
+uv run scripts/train.py pi05_cotrain_dualarm_armframe --exp-name=<run> --overwrite \
+  --save-interval=2000 --keep-period=None
+```
+
+- The config reads the dataset named by its `repo_id` (`cotrain_dualarm5`).
+  Change it in `config.py` if you pack under another name.
+- Recompute the norm stats whenever the dataset changes.
+- Checkpoints go to `checkpoints/<config>/<run>/<step>/`. With the flags above
+  only the latest one is kept, and the final step is always saved. Use
+  `--resume` instead of `--overwrite` to continue an interrupted run.
+- [train_grip_fast.sh](train_grip_fast.sh) is our SLURM script for a preemptible
+  queue: it waits for the dataset and norm stats, then starts or resumes. Its
+  paths are specific to our cluster.
+
+### 4.5 Deploy (local)
+
+Copy the checkpoint directory (`params/` and `assets/`) to the workstation, then:
+
+```bash
+python local_inference_eef.py \
+  --checkpoint checkpoints/pi05_cotrain_dualarm_armframe/<run>/<step> \
+  --config-name pi05_cotrain_dualarm_armframe \
+  --task "hang the mug on the mug tree" \
+  --arm0-gripper get --start-from-lead --dry-run
+```
+
+Remove `--dry-run` once the printed targets look right.
+
+| Flag | Effect |
+|---|---|
+| `--dual-arm --arm1-gripper <name>` | drive both arms |
+| `--start-from-lead` | first move the follower to the leader's joint angles, so the rollout starts in the same arm configuration as the demonstrations |
+| `--chunk N` | re-plan every N steps (default 10: execute the whole chunk) |
+| `--timeout S` | stop after S seconds |
+| `--log-joints` | print joint angles and joint-limit warnings |
+
+`q` or `Esc` stops the rollout. On exit the arm holds its position and opens
+the gripper; pressing Enter then moves it to the zero position. `--config-name`
+must be the config the checkpoint was trained with.
 
 ---
 
-## 5. Pipeline B — task space (EEF), UMI + teleop co-training
+## 5. Key files
 
-The goal: collect a new skill cheaply with a **handheld UMI gripper** and inject
-it into the robot, co-trained with AIRBOT teleop data, by mapping both sources
-into **one shared task-space representation**.
-
-### 5.1 Shared representation
-Every sample (UMI and teleop) is converted to the same schema:
-
-- **state / action = 10D = `pos(3) + rot6d(6) + gripper(1)`**, expressed in a
-  per-episode relative frame **W′** (origin = first-frame fingertip, z = gravity,
-  first-frame yaw zeroed; pitch/roll kept gravity-absolute). This makes both
-  sources "rootless" and embodiment-agnostic.
-- **gripper** normalized by the robot's max opening (÷0.073, clip [0,1]); 0 = closed.
-  The action channel uses the **lead/commanded** gripper so grasps express
-  closing force (not just the achieved width).
-- **two camera slots**: `wrist_image` (always valid) and `image` (env/head camera).
-- **`env_mask`**: 1 = env camera valid (teleop), 0 = masked (UMI has no global
-  camera). This lets a single policy co-train across heterogeneous sensor sets.
-- **camera FOV match**: UMI's fisheye is de-fisheyed to ~79° to match the D405's 78.6°.
-
-### 5.2 Steps
-```bash
-# (a) Collect teleop EEF data — records base-frame EEF (pos+quat+gripper) via the
-#     vendor FK get_end_pose. The lead→follow gripper-range correction is built in.
-python airbot/collect_data.py --task "pick up the block and place it in the bowl" \
-  --output-dir /home/you/pi_data --repo-id airbot_play_data
-python airbot/collect_data.py --task "wipe the blackboard" \
-  --output-dir /home/you/pi_data --repo-id airbot_wipe_data
-
-# (b) Pack UMI mcaps + (one or more) teleop datasets into one EEF dataset.
-#     Each teleop episode's prompt is read automatically from its source tasks.jsonl;
-#     datasets-v4 "List" feature type is auto-downgraded for server compatibility.
-python umi/pack_lerobot.py \
-  --umi-dir /path/to/umi_mcaps \
-  --teleop-dir /home/you/pi_data/airbot_play_data /home/you/pi_data/airbot_wipe_data \
-  -o /home/you/pi_data/cotrain_eef --repo-id cotrain_eef --verify
-#   (--skip-umi packs teleop only, for the ablation config pi05_teleop_eef)
-
-# (c) Train (server)
-uv run scripts/compute_norm_stats.py --config-name pi05_cotrain_eef
-uv run scripts/train.py pi05_cotrain_eef --exp-name cotrain_v1
-
-# (d) Deploy (local). env-mask=1 uses the head camera (recommended once the task
-#     has teleop data); single-camera UMI-only tasks use env-mask=0.
-python local_inference_eef.py --checkpoint ./checkpoints/pi05_cotrain_eef/cotrain_v1/17000 \
-  --task "pick up the block and place it in the bowl" --env-mask 1 \
-  --speed-profile fast --speed-scale 0.3
-```
-
-### 5.3 Offline open-loop eval (no robot)
-Validate that the model actually learned an episode by feeding recorded
-observations and comparing predicted vs ground-truth actions (a low flow-matching
-loss does **not** guarantee good sampled actions):
-```bash
-python eval_eef_offline.py --checkpoint <ckpt> --dataset /home/you/pi_data/cotrain_eef \
-  --task-filter "block" --plot eval_block.png
-#  --force-env-mask 0/1 to probe sensitivity to the env-camera mask
-```
-
-> Deployment is closed-loop: the model is re-queried each chunk from the live
-> `get_end_pose`, which is self-correcting. Note that a wrongly-actuated gripper
-> dimension feeds back into the observed state and corrupts pose prediction too —
-> so the gripper denormalization and lead-gripper action source matter for the
-> whole policy, not just the gripper.
-
----
-
-## 6. Datasets & weights (HuggingFace)
-
-Datasets and fine-tuned weights are **not** in git.
-```bash
-hf auth login
-hf upload <user>/<dataset> "$HF_LEROBOT_HOME/<dataset>" . --repo-type dataset
-cd checkpoints/<config>/<exp>/<step> && hf upload <user>/<weights> . --exclude "train_state/*"
-```
-`HF_LEROBOT_HOME` is the LeRobot dataset root; collection, packing and training
-all resolve datasets relative to it, so export it before training.
-
----
-
-## 7. Key files
 | Path | Purpose |
 |---|---|
-| [airbot/collect_data.py](airbot/collect_data.py) | Teleop + dual-camera collection → LeRobot (joint 7D **and** base-frame EEF 8D); lead→follow gripper rescaling. |
-| [airbot/play_sdk.py](airbot/play_sdk.py) | AIRBOT Play arm + camera wrapper. |
-| [airbot/play_config.json](airbot/play_config.json) | Ports, camera serials, workspace bounds. |
-| [umi/umi_to_lerobot.py](umi/umi_to_lerobot.py) | UMI mcap → de-fisheyed video + W′ pose + gripper-norm. |
-| [umi/pack_lerobot.py](umi/pack_lerobot.py) | Stage-4 packer: UMI + teleop → one shared EEF dataset. |
-| [umi/replay_check.py](umi/replay_check.py) | Real-robot replay validation of the coordinate chain. |
-| [local_inference.py](local_inference.py) | Joint-space real-time inference (Pipeline A). |
-| [local_inference_eef.py](local_inference_eef.py) | Task-space (EEF) real-time inference (Pipeline B). |
-| [eval_eef_offline.py](eval_eef_offline.py) | Offline open-loop eval (predicted vs GT actions). |
-| `src/openpi/policies/airbot_eef_policy.py` | EEF data ↔ model transforms (10D state, env_mask, optional gripper point cloud). |
-| `src/openpi/training/config.py` | Configs `pi05_airbot_play`, `pi05_cotrain_eef`, `pi05_teleop_eef`, `pi05_teleop_eef_grip`. |
-| [gripper_geom/](gripper_geom/) | Gripper-geometry toolkit (see §6). |
+| [airbot/collect_data.py](airbot/collect_data.py) | Teleoperated collection, single or dual arm |
+| [airbot/play_sdk.py](airbot/play_sdk.py) | AIRBOT Play wrapper used at deployment |
+| [gripper_geom/gripper_params.py](gripper_geom/gripper_params.py) | Per-gripper opening range |
+| [gripper_geom/](gripper_geom/) | Scripts that build the gripper point-cloud files |
+| [umi/pack_lerobot_fast.py](umi/pack_lerobot_fast.py) | Packer: raw recordings → one 20-D dataset, with incremental append |
+| `src/openpi/training/config.py` | Training config `pi05_cotrain_dualarm_armframe` |
+| `src/openpi/policies/airbot_eef_policy.py` | Mapping between dataset columns and model inputs |
+| `scripts/compute_norm_stats.py`, `scripts/train.py` | Norm stats and training |
+| [local_inference_eef.py](local_inference_eef.py) | Real-robot deployment, single or dual arm |
+| [train_grip_fast.sh](train_grip_fast.sh) | SLURM script (cluster-specific) |
 
 ---
 
-## 8. Roadmap — gripper-aware, cross-gripper training (in progress)
+## 6. Notes
 
-The current research direction: **teach the policy to exploit a 1-DOF gripper's
-distinct functional regions** (e.g. the GET gripper's fingertip vs. rear) **and to
-co-train across heterogeneous grippers** (parallel / GET / Robotiq) in one model.
+- Datasets and checkpoints are not in git.
+- `local_inference.py`, `eval_eef_offline.py` and `umi/pack_lerobot.py` belong to
+  earlier pipelines (joint-space, and 10-D single-arm) whose training configs
+  have been removed. They do not run with the config described here.
 
-Method (Option C): encode each gripper's CAD-sampled **point cloud (in the TCP /
-`get_end_pose` frame)** into one token via a small PointNet, splice it into the pi0
-prefix (`embed_prefix`). The action expert attends to it, so the policy can compose
-"where the TCP moves" with "where each region is" → uses the right region per task,
-and adapts when the gripper (token) changes. The geometry is **declarative & constant
-per gripper**, so existing datasets are retrofitted by tagging — no re-collection.
+## License and acknowledgements
 
-Toolkit in [gripper_geom/](gripper_geom/):
-- `inspect_meshes.py` — confirm which URDF meshes are the gripper.
-- `build_parallel_descriptor.py` — assemble gripper meshes into the TCP frame via the
-  URDF joints, sample a point cloud + functional-region anchors, save a descriptor
-  `.npy`; `--tcp-rpy` aligns every gripper to one common convention (+X = approach, +Z = up).
-- `project_gripper_overlay.py` — project the cloud onto the live wrist camera (coarse sanity check).
-- `axis_check.py` — kinematically verify the `get_end_pose` tool-frame axes.
-
-Network changes (behind `Pi0Config.gripper_token`, default off → no behavior change):
-`gripper_pc` field on `Observation`, a `PointNetEncoder` in `pi0.py`, the prefix splice,
-and the descriptor injection in `AirbotEEFInputs`. Config `pi05_teleop_eef_grip` enables
-it for a parallel-only **regression A/B** (token on vs off should match on the
-gold-standard teleop data before mixing in other grippers).
-
-> Descriptor `.npy` files are gitignored (regenerable from CAD); copy them to the
-> server before training a `gripper_token` config.
-
----
-
-## 9. Cleanup
-```bash
-conda env remove -n openpi_airbot
-rm -rf .venv
-du -sh ~/.cache/openpi ~/.cache/huggingface   # shared caches, clear as needed
-```
+Built on [openpi](https://github.com/Physical-Intelligence/openpi) by Physical
+Intelligence and released under the same Apache 2.0 license ([LICENSE](LICENSE)).
+This is not an official openpi release.
