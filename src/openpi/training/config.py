@@ -1280,6 +1280,49 @@ _CONFIGS = [
         ema_decay=None,
     ),
     TrainConfig(
+        name="pi05_cotrain_dualarm_nodrop",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            gripper_token=True,
+            num_gripper_points=256,
+            region_tokens=True,
+            film_geometry=True,
+            # 全量数据、不遮相机: 与 pi05_single_parallel_sweep 配对, 只差数据集(750 条 vs 50 条),
+            # 用于回答"多任务多爪共训对单个任务有没有帮助"。遮断版见 _armframe。
+            cam_dropout=(0.0, 0.0, 0.0),
+        ),
+        data=LeRobotAirbotEEFDataConfig(
+            repo_id="cotrain_dualarm5",   # 追加 GET 抽屉后 750 条; 多出的 effort 列被 repack 忽略
+            grippers_npz_path="gripper_geom/grippers_armframe.npz",
+            gripper_names=("parallel", "get", "get_yam"),   # get_yam: 同一把 GET 装在 YAM 臂上
+            num_gripper_points=256,
+            gripper_aug=True,
+            dual=True,
+            region_tokens=True,
+            arm_frame=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=48,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=3.5e-5,
+            decay_steps=40_000,
+            decay_lr=3.5e-6,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
         name="pi05_single_parallel_sweep",
         model=pi0_config.Pi0Config(
             pi05=True,
@@ -1298,6 +1341,49 @@ _CONFIGS = [
             repo_id="single_parallel_sweep",   # parallel/sweep_task 两目录 50 条(双臂, 两爪皆 parallel)
             grippers_npz_path="gripper_geom/grippers_armframe.npz",
             gripper_names=("parallel", "get"),
+            num_gripper_points=256,
+            gripper_aug=True,
+            dual=True,
+            region_tokens=True,
+            arm_frame=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=48,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=3.5e-5,
+            decay_steps=20_000,
+            decay_lr=3.5e-6,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_single_yam_sweep",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            gripper_token=True,
+            num_gripper_points=256,
+            region_tokens=True,
+            film_geometry=True,
+            # 单任务/单爪对照: 只用平行爪扫地 50 条, 不遮相机。与 armframe 配置的差别只有
+            # 数据集、遮断关闭、步数(数据少 20 倍, 40k 步会过拟合)。
+            cam_dropout=(0.0, 0.0, 0.0),
+        ),
+        data=LeRobotAirbotEEFDataConfig(
+            repo_id="single_yam_sweep",   # YAM 臂 + GET 扫地 50 条(单臂; 演示备选: 只学这一个场景)
+            grippers_npz_path="gripper_geom/grippers_armframe.npz",
+            gripper_names=("parallel", "get", "get_yam"),
             num_gripper_points=256,
             gripper_aug=True,
             dual=True,

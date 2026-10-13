@@ -47,9 +47,9 @@ else
 fi
 
 set -e
-# save-interval=2000 是抢占保险(gpu_requeue), 不能去; keep-period=5000: 小数据集可能过拟合,
-# 保留 5000/10000/15000 + 终档(19999), 方便回头挑最好的一档。
+# save-interval=2000 是抢占保险(gpu_requeue), 不能去; keep-period=None + orbax max_to_keep=1:
+# 只留最新一档(每档含优化器状态约 12 GB, 家目录配额有限, 2026-10-12 曾因多留一档写满磁盘)。
 uv run --no-sync scripts/train.py $CONFIG \
   --exp-name=sweep_single_v1 $MODE \
   --save-interval=2000 \
-  --keep-period=5000
+  --keep-period=None

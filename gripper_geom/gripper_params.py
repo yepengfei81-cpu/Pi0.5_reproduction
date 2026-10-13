@@ -20,6 +20,9 @@ GRIPPER_PARAMS = {
     #      (物理全开宽度卡尺量得 62mm, 仅记录; 归一化用 get_eef_pos 读数。)
     #      board_z=-0.05: 指尖顶板测得 -0.044, 抓板擦擦时略高 -> -0.05(配 --press 0 起步，实测更低的数值能让模型发挥更好)。
     "get":      {"close": 0.0089, "open": 0.0701, "tcp_offset": (0.017, 0.0, 0.0), "board_z": -0.05},
+    # GET 装在 YAM 臂上: 几何同 get(点云在 npz 里是 get 的别名), 但 collect_data_yam.py 已把夹爪读数
+    # 归一化成 0=闭/1=开 存盘, 所以这里 close/open 就是 0/1; ARP 由采集脚本的 --tool-offset 保证与 AIRBOT 一致。
+    "get_yam":  {"close": 0.0, "open": 1.0, "tcp_offset": (0.017, 0.0, 0.0), "board_z": None},
 }
 
 
