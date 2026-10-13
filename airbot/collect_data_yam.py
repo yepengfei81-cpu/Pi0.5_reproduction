@@ -25,6 +25,8 @@
   先手动全开/全闭各读一次, 填 --grip-open / --grip-closed, 存盘统一归一化到 0=闭 1=开。
   leader 的 GELLO 夹爪由 gello 归一化为 0=开 1=闭(脚本已翻转); leader=yam 时同 follower 的量程参数。
 
+通用依赖(lerobot/pyrealsense2 等)见 README §3.4; i2rt 与 gello_software 按各自文档安装; 输出格式见 airbot/DATA_FORMAT.md。
+
 用法:
   python airbot/collect_data_yam.py --fk-check                       # 不连硬件: 验证内嵌 FK
   python airbot/collect_data_yam.py --fake --task x --repo-id t -o /tmp/yamtest   # 不连硬件: 假臂走通写盘

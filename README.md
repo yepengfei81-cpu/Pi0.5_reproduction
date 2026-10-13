@@ -189,6 +189,15 @@ GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 
 The server needs `ffmpeg` to decode the H.264 camera videos.
 
+### 3.6 YAM collection machine (no AIRBOT)
+
+Follow §3.4 but skip the AIRBOT driver and SDK. Install the YAM SDK
+(`i2rt`) and the GELLO software following their own documentation. Then run
+`python airbot/collect_data_yam.py --fk-check` (no hardware) and
+`python airbot/collect_data_yam.py --dry-run ...` (hardware, no recording); the
+script's docstring lists the values to measure on the mounted gripper, and the
+output format is in [airbot/DATA_FORMAT.md](airbot/DATA_FORMAT.md).
+
 ---
 
 ## 4. Step by step

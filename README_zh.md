@@ -160,6 +160,13 @@ GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
 
 服务器需要 `ffmpeg` 来解码 H.264 相机视频。
 
+### 3.6 YAM 采集机(没有 AIRBOT 的那台)
+
+按 §3.4 安装,跳过 AIRBOT 的驱动和 SDK。YAM 的 SDK(`i2rt`)和 GELLO 软件按它们各自的文档安装。
+然后运行 `python airbot/collect_data_yam.py --fk-check`(不接硬件)和
+`python airbot/collect_data_yam.py --dry-run ...`(接硬件、不录);装好夹爪后要量的几个数在脚本的
+文档字符串里,输出格式见 [airbot/DATA_FORMAT.md](airbot/DATA_FORMAT.md)。
+
 ---
 
 ## 4. 分步操作
