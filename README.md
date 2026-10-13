@@ -32,6 +32,9 @@ The model's proprioceptive input comes entirely from what the arm reports about
 itself: end-effector pose and gripper opening. Joint angles, velocities and
 torques are not model inputs.
 
+The exact on-disk format of a raw recording, and the conventions a collector
+for another arm must follow, are in [airbot/DATA_FORMAT.md](airbot/DATA_FORMAT.md).
+
 ### 1.2 State and action: 20-D
 
 Each arm contributes 10 numbers. Arm 0 is the right arm, arm 1 the left.
@@ -325,7 +328,9 @@ must be the config the checkpoint was trained with.
 
 | Path | Purpose |
 |---|---|
-| [airbot/collect_data.py](airbot/collect_data.py) | Teleoperated collection, single or dual arm |
+| [airbot/collect_data.py](airbot/collect_data.py) | Teleoperated collection, single or dual arm (AIRBOT Play) |
+| [airbot/collect_data_yam.py](airbot/collect_data_yam.py) | Same, for the YAM arm with a GELLO leader |
+| [airbot/DATA_FORMAT.md](airbot/DATA_FORMAT.md) | Raw recording format and conventions for adding an arm |
 | [airbot/play_sdk.py](airbot/play_sdk.py) | AIRBOT Play wrapper used at deployment |
 | [gripper_geom/gripper_params.py](gripper_geom/gripper_params.py) | Per-gripper opening range |
 | [gripper_geom/](gripper_geom/) | Scripts that build the gripper point-cloud files |

@@ -1293,6 +1293,7 @@ _CONFIGS = [
             # 全量数据、不遮相机: 与 pi05_single_parallel_sweep 配对, 只差数据集(750 条 vs 50 条),
             # 用于回答"多任务多爪共训对单个任务有没有帮助"。遮断版见 _armframe。
             cam_dropout=(0.0, 0.0, 0.0),
+            llm_remat_policy="dots_saveable",   # 显存换速度(~20-35%), 数学等价; H200/96G 卡都放得下
         ),
         data=LeRobotAirbotEEFDataConfig(
             repo_id="cotrain_dualarm5",   # 追加 GET 抽屉后 750 条; 多出的 effort 列被 repack 忽略
@@ -1379,6 +1380,7 @@ _CONFIGS = [
             # 单任务/单爪对照: 只用平行爪扫地 50 条, 不遮相机。与 armframe 配置的差别只有
             # 数据集、遮断关闭、步数(数据少 20 倍, 40k 步会过拟合)。
             cam_dropout=(0.0, 0.0, 0.0),
+            llm_remat_policy="dots_saveable",   # 显存换速度(~20-35%), 数学等价; H200/96G 卡都放得下
         ),
         data=LeRobotAirbotEEFDataConfig(
             repo_id="single_yam_sweep",   # YAM 臂 + GET 扫地 50 条(单臂; 演示备选: 只学这一个场景)

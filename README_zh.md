@@ -24,6 +24,9 @@
 模型的本体感知输入全部来自机械臂对自身的报告:末端位姿和夹爪开度。
 关节角、关节速度和力矩都不是模型输入。
 
+原始录制数据在磁盘上的确切格式,以及给其他机械臂写采集脚本时必须遵守的约定,见
+[airbot/DATA_FORMAT.md](airbot/DATA_FORMAT.md)。
+
 ### 1.2 状态与动作:20 维
 
 每条臂占 10 个数。臂 0 是右臂,臂 1 是左臂。
@@ -278,7 +281,9 @@ python local_inference_eef.py \
 
 | 路径 | 用途 |
 |---|---|
-| [airbot/collect_data.py](airbot/collect_data.py) | 遥操作采集(单臂 / 双臂) |
+| [airbot/collect_data.py](airbot/collect_data.py) | 遥操作采集(单臂 / 双臂,AIRBOT Play) |
+| [airbot/collect_data_yam.py](airbot/collect_data_yam.py) | 同上,YAM 臂 + GELLO 主臂 |
+| [airbot/DATA_FORMAT.md](airbot/DATA_FORMAT.md) | 原始采集格式与新臂接入约定 |
 | [airbot/play_sdk.py](airbot/play_sdk.py) | 部署时用的 AIRBOT Play 封装 |
 | [gripper_geom/gripper_params.py](gripper_geom/gripper_params.py) | 每把夹爪的开合范围 |
 | [gripper_geom/](gripper_geom/) | 生成夹爪点云文件的脚本 |

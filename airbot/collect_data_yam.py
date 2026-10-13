@@ -85,8 +85,8 @@ def _axang(a, t):
     return np.eye(3) + np.sin(t) * K + (1 - np.cos(t)) * K @ K
 
 
-def yam_fk(q, tool_offset=0.0, tool_roll_deg=0.0):
-    """6 关节角(rad) -> (pos(3), quat xyzw) : base 系下 ARP 位姿, 工具系按我们的约定(+X 前, +Z 上)。"""
+def yam_fk_R(q, tool_offset=0.0, tool_roll_deg=0.0):
+    """6 关节角(rad) -> (pos(3), R(3x3)) : base 系下 ARP 位姿, 工具系按我们的约定(+X 前, +Z 上)。"""
     T = np.eye(4)
     for (xyz, rpy, axis), qi in zip(YAM_CHAIN, q):
         A = np.eye(4); A[:3, :3] = _rpy(*rpy); A[:3, 3] = xyz
@@ -94,7 +94,46 @@ def yam_fk(q, tool_offset=0.0, tool_roll_deg=0.0):
         T = T @ A @ B
     R = T[:3, :3] @ YAM_TO_TOOL @ _axang((1.0, 0.0, 0.0), math.radians(tool_roll_deg))
     p = T[:3, 3] + R[:, 0] * tool_offset          # 沿接近方向前移到 ARP
+    return p, R
+
+
+def yam_fk(q, tool_offset=0.0, tool_roll_deg=0.0):
+    """同 yam_fk_R, 但姿态给四元数 xyzw(采集存盘用)。"""
+    p, R = yam_fk_R(q, tool_offset, tool_roll_deg)
     return p, rot_to_quat_xyzw(R)
+
+
+def _rotvec(R):
+    """旋转矩阵 -> 旋转向量(轴*角)。"""
+    c = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0); th = math.acos(c)
+    if th < 1e-9:
+        return np.zeros(3)
+    return th / (2.0 * math.sin(th)) * np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+
+
+def yam_ik(p_t, R_t, q0, tool_offset=0.0, tool_roll_deg=0.0, iters=60, damping=0.05,
+           tol_pos=3e-4, tol_rot_deg=0.2, max_step_rad=0.3):
+    """阻尼最小二乘数值 IK(有限差分雅可比), 从 q0 出发求到达 (p_t, R_t) 的关节角。
+    返回 (q, 位置残差 m, 姿态残差 deg, 是否收敛)。每拍目标离上一拍很近, 从上一拍的解起步 2-5 次迭代即收敛。"""
+    q = np.asarray(q0, float).copy(); lo = np.array([l for l, _ in YAM_JOINT_LIMITS]); hi = np.array([h for _, h in YAM_JOINT_LIMITS])
+    tol_rot = math.radians(tol_rot_deg); eps = 1e-6
+    for _ in range(iters):
+        p, R = yam_fk_R(q, tool_offset, tool_roll_deg)
+        e = np.concatenate([p_t - p, _rotvec(R_t @ R.T)])
+        if np.linalg.norm(e[:3]) < tol_pos and np.linalg.norm(e[3:]) < tol_rot:
+            return q, float(np.linalg.norm(e[:3])), math.degrees(np.linalg.norm(e[3:])), True
+        J = np.zeros((6, 6))
+        for j in range(6):
+            dq = np.zeros(6); dq[j] = eps
+            p2, R2 = yam_fk_R(q + dq, tool_offset, tool_roll_deg)
+            J[:3, j] = (p2 - p) / eps; J[3:, j] = _rotvec(R2 @ R.T) / eps
+        step = J.T @ np.linalg.solve(J @ J.T + (damping ** 2) * np.eye(6), e)
+        n = np.linalg.norm(step)
+        if n > max_step_rad:
+            step *= max_step_rad / n
+        q = np.clip(q + step, lo, hi)
+    p, R = yam_fk_R(q, tool_offset, tool_roll_deg); e = np.concatenate([p_t - p, _rotvec(R_t @ R.T)])
+    return q, float(np.linalg.norm(e[:3])), math.degrees(np.linalg.norm(e[3:])), False
 
 
 def rot_to_quat_xyzw(R):
