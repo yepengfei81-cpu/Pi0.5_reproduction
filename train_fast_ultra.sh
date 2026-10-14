@@ -1,19 +1,21 @@
 #!/bin/bash
 #SBATCH --job-name=ultra_nodrop
-#SBATCH --partition=gpu_requeue,gpu
+#SBATCH --partition=gpu_requeue
 #SBATCH --requeue
 #SBATCH --open-mode=append
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
-#SBATCH --constraint="h200|h100"
+#SBATCH --constraint=h200|h100
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
-#SBATCH --time=40:00:00
+#SBATCH --time=16:00:00
 #SBATCH --output=slurm-%j.out
 #
-# "见缝插针"版: H200 或 H100, 1 张或 2 张都接, gpu_requeue 和 gpu 两个分区同时排队。
-# 只要 H200 就 sbatch --constraint=h200 ...; 特性名以 sinfo -p gpu_requeue -o "%f" | sort -u 为准。
+# "见缝插针"版: gpu_requeue 分区里 H200 或 H100, 1 张或 2 张都接。
+# (2026-10-15 实测: gpu_requeue 特性名 h200/h100/a100/rtx6000pro, 时限上限 3 天; gpu 分区没有这些节点,
+#  --partition=gpu_requeue,gpu 多分区提交会整体 BadConstraints, 所以只投 gpu_requeue。)
+# 想只要 H200: sbatch --constraint=h200 ...; 1 卡建议 --time=36:00:00(剩余步数多时), 2 卡 16h 够。
 # 用法(同一脚本投两次, 两个变体共用一个 checkpoint 目录, 靠锁文件协调):
 #   sbatch --gres=gpu:2 train_fast_ultra.sh
 #   sbatch --gres=gpu:1 train_fast_ultra.sh

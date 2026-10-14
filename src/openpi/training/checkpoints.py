@@ -97,12 +97,20 @@ def restore_state(
     with at.disable_typechecking():
         # Split params that can be used for inference into a separate item.
         train_state, params = _split_params(state)
+        params_item = {"params": params}
+        # 用 args 接口并显式给 restore_args: 目标叶子若是带 sharding 的 ShapeDtypeStruct, orbax 会按它
+        # 重分片, 存档时的卡数与现在不同也能续(legacy 的 items= 读法会无视目标分片, 只能沿用存档里的,
+        # 1 卡存 2 卡续时报 "sharding ... Got None")。不带 sharding 的目标行为与原来一致。
         restored = checkpoint_manager.restore(
             step,
-            items={
-                "train_state": train_state,
-                "params": {"params": params},
-            },
+            args=ocp.args.Composite(
+                train_state=ocp.args.PyTreeRestore(
+                    item=train_state, restore_args=ocp.checkpoint_utils.construct_restore_args(train_state)
+                ),
+                params=ocp.args.PyTreeRestore(
+                    item=params_item, restore_args=ocp.checkpoint_utils.construct_restore_args(params_item)
+                ),
+            ),
         )
     return _merge_params(restored["train_state"], restored["params"])
 

@@ -299,7 +299,16 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        # 续档目标显式带上当前 mesh 的分片: 不带的话 orbax 只能沿用存档里记录的分片, 存档时的卡数
+        # 与现在不同(如 1 卡存、2 卡续)就报 "sharding ... Got None"; 带上后 orbax 自动重分片。
+        try:
+            restore_target = jax.tree.map(
+                lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), train_state, train_state_sharding
+            )
+        except Exception as e:  # noqa: BLE001
+            logging.warning(f"构造带分片的续档目标失败({e}), 退回不带分片的目标(要求与存档时同卡数)")
+            restore_target = train_state
+        train_state = _checkpoints.restore_state(checkpoint_manager, restore_target, data_loader)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
