@@ -6,13 +6,14 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=h200
+#SBATCH --constraint="h200|h100"
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=40:00:00
 #SBATCH --output=slurm-%j.out
 #
-# "见缝插针"版: 只要是 H200, 1 张或 2 张都接, gpu_requeue 和 gpu 两个分区同时排队。
+# "见缝插针"版: H200 或 H100, 1 张或 2 张都接, gpu_requeue 和 gpu 两个分区同时排队。
+# 只要 H200 就 sbatch --constraint=h200 ...; 特性名以 sinfo -p gpu_requeue -o "%f" | sort -u 为准。
 # 用法(同一脚本投两次, 两个变体共用一个 checkpoint 目录, 靠锁文件协调):
 #   sbatch --gres=gpu:2 train_fast_ultra.sh
 #   sbatch --gres=gpu:1 train_fast_ultra.sh
@@ -21,8 +22,8 @@
 #   - 卡多的作业启动时发现卡少的在跑 -> 取消它, 从最新档续训(最多丢 2000 步);
 #   - 卡少的作业启动时发现卡多的在跑 -> 让位退出, 并给自己 1 小时后再投一次(卡多的若被抢占, 它来补位);
 #   - 终档 39999 存在 -> 任何变体都直接退出, 不再续投。
-#   - 1 卡: batch 48 全在一张卡上, remat 切回 nothing_saveable 防 OOM(慢 20-35%, 但能跑);
-#     2 卡: 用配置里的 dots_saveable。
+#   - remat: 只有 "≥2 卡且是 H200(141 GB)" 才用配置里的 dots_saveable(快 20-35%);
+#     1 卡(batch 48 全压一张卡)或 H100(80 GB) 一律切回 nothing_saveable 防 OOM。
 
 export LD_LIBRARY_PATH=$HOME/.conda/envs/ffmpeg/lib:$LD_LIBRARY_PATH
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
@@ -84,10 +85,13 @@ else
     MODE=--overwrite; echo ">>> 无档位 -> fresh start"
 fi
 
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
 REMAT=()
-if [ "$NGPU" -le 1 ]; then
+if [ "$NGPU" -le 1 ] || ! echo "$GPU_NAME" | grep -qi "H200"; then
     REMAT=(--model.llm-remat-policy nothing_saveable)
-    echo ">>> 单卡: remat 切回 nothing_saveable(防 OOM)"
+    echo ">>> ${NGPU} 卡 / ${GPU_NAME:-未知卡型}: remat 切回 nothing_saveable(防 OOM)"
+else
+    echo ">>> ${NGPU} 卡 / ${GPU_NAME}: 用配置里的 dots_saveable"
 fi
 
 set -e
