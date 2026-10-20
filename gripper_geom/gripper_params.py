@@ -23,6 +23,10 @@ GRIPPER_PARAMS = {
     # GET 装在 YAM 臂上: 几何同 get(点云在 npz 里是 get 的别名), 但 collect_data_yam.py 已把夹爪读数
     # 归一化成 0=闭/1=开 存盘, 所以这里 close/open 就是 0/1; ARP 由采集脚本的 --tool-offset 保证与 AIRBOT 一致。
     "get_yam":  {"close": 0.0, "open": 1.0, "tcp_offset": (0.017, 0.0, 0.0), "board_z": None},
+    # GET 2.0 装在 AIRBOT 上(cad/GET_V2, 为 AIRBOT 滑轨设计): 点云同 get_yam(npz 里 get2 是别名)。
+    # close/open 暂用 GET v1 的读数(同一根滑轨, 全开一样; 刚闭合随指厚略有差别), 有空用 teach_probe.py 量一次替换。
+    # tcp_offset: 指尖相对 ARP 的伸出量 = (安装面->指尖 卡尺值) − 0.0735; 暂按 GET v1 的 17mm, 量完改这里并重跑 align_to_arm_frame.py。
+    "get2":     {"close": 0.0003, "open": 0.0688, "tcp_offset": (0.017, 0.0, 0.0), "board_z": None},   # 2026-10-14 teach_probe 实测: 全开 0.0688, 滑轨到底 0.0003(指尖未提前顶住)
 }
 
 

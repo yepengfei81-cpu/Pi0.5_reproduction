@@ -21,7 +21,9 @@
 | 08-29 | effort_v1 | pi05_cotrain_dualarm_effort | cotrain_dualarm5(700) | 力感知 Level A: 与 action_out_proj 并列的 effort_head, 预测未来 10 步 14D 原始电机力矩(臂0 6+夹爪1, 臂1 6+夹爪1), 掩码 MSE 权重 0.05; **只是训练辅助目标, 推理不用, 不是输入**; 40k 步 | 真机: 演示四任务不抽动但主观成功率下降 → 回退; 抽屉任务有"跳一下"式抽动(见下) | 9878296 |
 | 08-30 | armframe_v3 | pi05_cotrain_dualarm_armframe | cotrain_dualarm5(700) | 与 effort_v1 同数据同 40k 步, **只去掉力矩头**(effort_dim=0); 训练改为每 2000 步滚动存档 | **结果待记录** | 0661626, e86e01b, 9a439bb |
 | 10-12 | sweep_single_v1 | pi05_single_parallel_sweep | single_parallel_sweep(50) | 单任务/单爪对照: 只用平行爪扫地 50 条(双臂, 两爪皆 parallel), **无相机遮断**, 其余同 armframe; 20k 步, 每 2k 存档, 只留最新档 | **训练中**: 10-12 第一次跑到 16k 时家目录写满(ENOSPC)崩溃, 从 12000 续; 用途: 与 750 条共训权重在同一任务上比成功率 | (待提交) |
-| 10-13 | cotrain_nodrop_v1 | pi05_cotrain_dualarm_nodrop | cotrain_dualarm5(750, 含 GET 抽屉) | 全量数据、**无相机遮断**, 其余同 armframe; 40k 步 | **待训**(2026-10-14 决定: 放弃 YAM 数据, 就用 750 条); 用 train_fast_ultra.sh 见缝插针(1/2 张 H200, gpu_requeue+gpu 双分区, 锁文件协调) | (待提交) |
+| 10-13 | cotrain_nodrop_v1 | pi05_cotrain_dualarm_nodrop | cotrain_dualarm5(750, 含 GET 抽屉) | 全量数据、**无相机遮断**, 其余同 armframe; 40k 步 | **已训完**(2026-10-20, 39999); 20000 档曾用于 10-14 演示; 用 train_fast_ultra.sh 见缝插针(1/2 卡 H200/H100, 锁文件协调), 中途修了跨卡数续档 | (待提交) |
+| 10-20 | wipe_single_v1 | pi05_single_parallel_wipe | single_parallel_wipe(50) | 单任务/单爪对照(平行爪擦黑板), 同 sweep_single_v1 配方 | **待训**(train_single_pair.sh 先后跑两个) | (待提交) |
+| 10-20 | mug_single_v1 | pi05_single_parallel_mug | single_parallel_mug(50) | 单任务/单爪对照(平行爪挂杯), 同上 | **待训** | (待提交) |
 
 ## 贯穿的机制结论(论文脊柱)
 
