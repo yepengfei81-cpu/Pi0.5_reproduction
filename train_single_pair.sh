@@ -35,6 +35,12 @@ echo ">>> job $SLURM_JOB_ID: ${NGPU} 卡 / ${GPU_NAME} ($(date)) remat=${REMAT[*
 
 for run in "${RUNS[@]}"; do
     set -- $run; CONFIG=$1; REPO=$2; EXP=$3
+    # ONLY=<exp> 只跑其中一个(拆成两个独立作业, 各要 1 卡 ~11h, 更容易回填进空档):
+    #   sbatch --export=ALL,ONLY=wipe_single_v1 --gres=gpu:1 --time=11:00:00 -c 8 --mem=64G train_single_pair.sh
+    #   sbatch --export=ALL,ONLY=mug_single_v1  --gres=gpu:1 --time=11:00:00 -c 8 --mem=64G train_single_pair.sh
+    if [ -n "${ONLY:-}" ] && [ "$ONLY" != "$EXP" ]; then
+        echo ">>> [$EXP] ONLY=$ONLY, 跳过"; continue
+    fi
     DATA="$HF_LEROBOT_HOME/$REPO/meta/info.json"
     NORM="assets/$CONFIG/$REPO/norm_stats.json"
     CKPT_DIR="checkpoints/$CONFIG/$EXP"
