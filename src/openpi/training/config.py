@@ -1366,6 +1366,50 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
+    # 三任务平行爪合集(150 条): 和 hqi 的三任务 mask 模型用完全相同的示教, 走我们自己的管线, 作同数据对照。
+    TrainConfig(
+        name="pi05_three_parallel",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            gripper_token=True,
+            num_gripper_points=256,
+            region_tokens=True,
+            film_geometry=True,
+            # 单任务/单爪对照: 只用平行爪扫地 50 条, 不遮相机。与 armframe 配置的差别只有
+            # 数据集、遮断关闭、步数(数据少 20 倍, 40k 步会过拟合)。
+            cam_dropout=(0.0, 0.0, 0.0),
+        ),
+        data=LeRobotAirbotEEFDataConfig(
+            repo_id="three_parallel",   # parallel 爪 扫地50+擦黑板50+挂杯50 = 150 条(与他的三任务共训同数据), 单/双臂混排
+            grippers_npz_path="gripper_geom/grippers_armframe.npz",
+            gripper_names=("parallel", "get"),
+            num_gripper_points=256,
+            gripper_aug=True,
+            dual=True,
+            region_tokens=True,
+            arm_frame=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=48,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=3.5e-5,
+            decay_steps=20_000,
+            decay_lr=3.5e-6,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
     TrainConfig(
         name="pi05_single_parallel_wipe",
         model=pi0_config.Pi0Config(

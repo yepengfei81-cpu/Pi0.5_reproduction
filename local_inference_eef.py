@@ -24,12 +24,20 @@ W' 系: 每条臂在开局位姿各建一个 W'(原点=指尖, yaw 归零), 模�
   # (旧 10D 单臂配置已从 config.py 删除, 要部署老 10D checkpoint 需从 git 历史找回配置)
   # 擦黑板(接触任务): 加 --env-mask 0 --board-z-auto
 
-先 --dry-run(只推理+打印, 不动)验证坐标链。急停: q / Esc(有窗口)或终端输入 q。
-退出后停在原地 + 张开夹爪; 按回车可选自动回零。
+先 --dry-run(只推理+打印, 不动)验证坐标链。急停/结束本局: q / Esc(有窗口)或终端输入 q。
+一局结束后停在原地 + 张开夹爪, 然后问人: 成功 y / 失败 n / 作废 x, 进度, 备注; 复位场景后输入 y 才开始下一局
+(h=先回零), n=结束会话(可选回零)。每局计时 motion_time_s = 第一条运动指令 -> 结束键(对齐 lead / JIT 热身不算)。
+会话记录(缺省 data/runs/<时间>_<任务>/, --record DIR 指定, --no-record 关), 与 openpi_with_mask_realrobot 的 runner 同一布局:
+  session.json / episodes.jsonl(每局 human_success, motion_time_s, progress_pct, note, counted, stop_reason, n_infer)
+  epNNN/head/NNNNN_TTTTT.Ts.jpg + frames.csv(头部相机原图, --head-hz 默认 2Hz)   epNNN/infer/(每次推理的几路图)   epNNN/log.npz
+头部帧拼视频: ffmpeg -framerate 2 -pattern_type glob -i 'epNNN/head/*.jpg' -c:v libx264 -pix_fmt yuv420p epNNN.mp4
 """
 import argparse
+import json
 import logging
 import pathlib
+import queue
+import re
 import sys
 import threading
 import time
@@ -156,6 +164,22 @@ class EEFRunner:
         self.board_z = board_z; self.press = a.press; self.z_offset = a.start_z_offset
         self._stop = False
         self._vis = None
+        # 会话记录(session.json + episodes.jsonl + epNNN/{head/, infer/, log.npz}), 见顶部说明
+        self.head_hz = float(a.head_hz)
+        self.session_dir = None
+        if not a.no_record:
+            slug = re.sub(r"[^A-Za-z0-9]+", "_", a.task).strip("_")[:32]
+            self.session_dir = (pathlib.Path(a.record).expanduser() if a.record
+                                else _ROOT / "data" / "runs" / f"{time.strftime('%Y%m%d-%H%M%S')}_{slug}")
+            self.session_dir.mkdir(parents=True, exist_ok=True)
+            meta = {k: v for k, v in vars(a).items() if isinstance(v, (str, int, float, bool, type(None)))}
+            meta.update(started_unix=time.time(), started=time.strftime("%Y-%m-%d %H:%M:%S"), board_z=board_z, min_z=min_z)
+            (self.session_dir / "session.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+            print(f">>> 本次会话记录到 {self.session_dir}", flush=True)
+        self._infer_dir = None
+        self._rec = []
+        self._cam_lock = threading.Lock()     # wait_for_frames 不能两个线程同时对一条 pipeline 调
+        self.console = _Console()             # stdin 唯一读者: 推理中 q=急停, 局间问成败/是否继续
 
         print(f">>> [1/4] 加载模型 ({a.config_name})...", flush=True)
         self.cfg = _config.get_config(a.config_name)
@@ -264,7 +288,8 @@ class EEFRunner:
 
     # ---- 观测: 按模型维度组装(20D 缺臂1时按训练的单臂编码: REST10 + mask0 + 黑图) ----
     def get_observation(self):
-        head_bgr, w0_bgr, w1_bgr = self.cams.get_frames_dual()
+        with self._cam_lock:
+            head_bgr, w0_bgr, w1_bgr = self.cams.get_frames_dual()
         self._vis = (head_bgr, w0_bgr, w1_bgr) if self.model_dual else (head_bgr, w0_bgr)
         st0 = self.arm0.state_wprime()
         obs = {
@@ -289,6 +314,8 @@ class EEFRunner:
 
     # ---- 显示 / 急停 ----
     def _poll_stop(self):
+        if self.console.stop_requested():
+            self._stop = True
         if not self.show or self._vis is None:
             return
         labels = ("ENV [q=STOP]", "ARM0 WRIST(R)", "ARM1 WRIST(L)")
@@ -298,13 +325,6 @@ class EEFRunner:
         cv2.imshow("EEF Inference [q/Esc=stop]", np.hstack(imgs))
         if (cv2.waitKey(1) & 0xFF) in (ord('q'), 27):
             self._stop = True
-
-    def _stdin_stop(self):
-        def _l():
-            while not self._stop:
-                if sys.stdin.readline().strip().lower() in ("q", "stop"):
-                    self._stop = True; break
-        threading.Thread(target=_l, daemon=True).start()
 
     # ---- temporal ensembling: 对整条动作向量(10D/20D)加权平均, 再拆臂 ----
     def _ensemble(self, chunks, macro):
@@ -349,44 +369,84 @@ class EEFRunner:
             time.sleep(max(0.0, dt - (time.monotonic() - t0)))
 
     # ---- 主循环 ----
+    # ---- 主循环: 一个进程连续跑多局(模型/相机/臂只装一次), 每局: 对齐 -> 推理 -> 人工判定 -> 落盘 ----
     def run(self, num_steps=None, timeout=None):
         print(">>> 进入 run()", flush=True)
-        if not self.show and not self.dry_run:
-            self._stdin_stop()
+        results = []
         try:
-            if self.start_from_lead and not self.dry_run:
-                self._align_to_lead()
-            else:
-                print(">>> 在当前位姿建立 W'(不自动移动; 请先把臂摆到与训练开局相似的姿态)", flush=True)
-            # W': 臂0 带 board_z/press/z_offset 配准(接触任务); 臂1 用原始位姿
-            self.arm0.establish_wprime(self.board_z, self.press, self.z_offset)
-            if self.arm1 is not None:
-                self.arm1.establish_wprime()
+            ep = 0
+            while True:
+                rec = self._run_episode(ep, num_steps, timeout)
+                rec = self._end_episode(rec)
+                results.append(rec)
+                while True:      # 下一局必须明确输入 y 才开始(臂会动); 回车/别的键只会重问
+                    ans = self.console.ask(f"\n>>> 复位好场景、摆好 lead 之后, 输入 y 开始第 {ep + 1} 局 | "
+                                           "h=先回零点 | n=结束会话: ", default="n").lower()
+                    if ans in ("y", "n"):
+                        break
+                    if ans == "h":
+                        if not self.dry_run:
+                            self._go_home()
+                    else:
+                        print(">>> 请输入 y / h / n(回车不会开始)", flush=True)
+                if ans == "n":
+                    break
+                ep += 1
+        except KeyboardInterrupt:
+            print("\n>>> Ctrl+C: 结束本次会话", flush=True)
+        finally:
+            self._print_summary(results)
+            self.shutdown()
 
-            if not self.dry_run:
-                self.robot.set_speed_profile(self.speed_profile)   # 对在场的臂都设速度档
-                for arm in self._arms():
-                    arm.h.switch_mode(RobotMode.SERVO_CART_POSE)
-                time.sleep(0.2)
-                for arm in self._arms():        # 播种保持点
-                    p, q = arm.h.get_end_pose()
-                    arm.h.servo_cart_pose(list(p), list(q))
-                time.sleep(0.3)
+    def _run_episode(self, ep, num_steps, timeout):
+        """跑一局直到 q / --steps / --timeout。计时从第一条运动指令起算(对齐 lead、建 W'、JIT 热身不算)。"""
+        self._stop = False
+        self._rec, self._jguards = [], {}
+        ep_dir = self.session_dir / f"ep{ep:03d}" if self.session_dir is not None else None
+        self._infer_dir = None
+        if ep_dir is not None:
+            self._infer_dir = ep_dir / "infer"
+            self._infer_dir.mkdir(parents=True, exist_ok=True)
+        rec = {"episode": ep, "task": self.task, "t_episode_start_unix": round(time.time(), 3),
+               "t_motion_start_unix": None, "t_end_unix": None, "motion_time_s": None,
+               "stop_reason": None, "n_infer": 0, "dir": str(ep_dir) if ep_dir else None}
+        print(f"\n>>> ========== 第 {ep} 局 ==========", flush=True)
+        if self.start_from_lead and not self.dry_run:
+            self._align_to_lead()
+        else:
+            print(">>> 在当前位姿建立 W'(不自动移动; 请先把臂摆到与训练开局相似的姿态)", flush=True)
+        # W': 臂0 带 board_z/press/z_offset 配准(接触任务); 臂1 用原始位姿。每局重建(开局位姿可能不同)
+        self.arm0.establish_wprime(self.board_z, self.press, self.z_offset)
+        if self.arm1 is not None:
+            self.arm1.establish_wprime()
+
+        if not self.dry_run:
+            self.robot.set_speed_profile(self.speed_profile)   # 对在场的臂都设速度档
             for arm in self._arms():
-                arm.seed_last(self.dry_run)
+                arm.h.switch_mode(RobotMode.SERVO_CART_POSE)
+            time.sleep(0.2)
+            for arm in self._arms():        # 播种保持点
+                p, q = arm.h.get_end_pose()
+                arm.h.servo_cart_pose(list(p), list(q))
+            time.sleep(0.3)
+        for arm in self._arms():
+            arm.seed_last(self.dry_run)
 
-            t_start = time.monotonic()
-            macro = 0                 # 绝对 macro 时刻(=训练 10Hz 的一拍)
-            chunks = []               # [(start_macro, chunk (H, 10/20))] 用于时序集成
-            macro_dt = (1.0 / 10.0) / self.speed_scale
-            first = True
-            print(f">>> 进入推理循环(dry-run={self.dry_run}, ensemble_m={self.ensemble_m}, "
-                  f"重推间隔={self.chunk_execute}, speed_scale={self.speed_scale})", flush=True)
+        recorder = None
+        t_motion0 = None          # 第一条运动指令(monotonic); None = 一拍都没执行
+        t_start = time.monotonic()
+        macro = 0                 # 绝对 macro 时刻(=训练 10Hz 的一拍)
+        chunks = []               # [(start_macro, chunk (H, 10/20))] 用于时序集成
+        macro_dt = (1.0 / 10.0) / self.speed_scale
+        first = True
+        print(f">>> 进入推理循环(dry-run={self.dry_run}, ensemble_m={self.ensemble_m}, "
+              f"重推间隔={self.chunk_execute}, speed_scale={self.speed_scale}); q=结束本局", flush=True)
+        try:
             while not self._stop:
                 if num_steps and macro >= num_steps:
-                    break
+                    rec["stop_reason"] = "steps"; break
                 if timeout and time.monotonic() - t_start > timeout:
-                    break
+                    rec["stop_reason"] = "timeout"; break
 
                 if macro % self.chunk_execute == 0:
                     obs = self.get_observation()
@@ -396,6 +456,11 @@ class EEFRunner:
                     ti = time.monotonic()
                     cw = np.asarray(self.policy.infer(obs)["actions"], dtype=np.float32)
                     chunks.append((macro, cw))
+                    rec["n_infer"] += 1
+                    if self._infer_dir is not None:
+                        for im, name in zip(self._vis, ("head", "wrist0", "wrist1")):
+                            cv2.imwrite(str(self._infer_dir / f"{macro:05d}_{name}.jpg"), im)
+                        self._rec.append((macro, time.monotonic() - t_start, np.asarray(obs["observation/state"]).copy(), cw.copy()))
                     keep = max(2, -(-cw.shape[0] // self.chunk_execute))
                     chunks = chunks[-keep:]
                     st = obs["observation/state"]
@@ -408,7 +473,7 @@ class EEFRunner:
 
                 a_w = self._ensemble(chunks, macro)
                 if a_w is None:
-                    break
+                    rec["stop_reason"] = "no_action"; break
                 p0, q0, g0 = self.arm0.action_to_base(a_w[:10])
                 # 诊断: 指令层面的【跳变】= 相邻两拍位移量突变(加速度尖峰), 不是速度快。
                 # 搬运段 15-20mm/拍 是正常速度, 不报; 一拍位移比上一拍突然多/少 >12mm 才报。
@@ -438,6 +503,14 @@ class EEFRunner:
                     p1, q1, g1 = self.arm1.action_to_base(a_w[10:20])
                     tgt1 = (self._clamp_step(self.arm1, p1), q1, g1)
 
+                if t_motion0 is None:         # 计时起点 = 第一条运动指令(dry-run 时 = 第一次推理落地)
+                    t_motion0 = time.monotonic()
+                    rec["t_motion_start_unix"] = round(time.time(), 3)
+                    if ep_dir is not None and self.head_hz > 0:
+                        recorder = _HeadRecorder(self.cams, self._cam_lock, ep_dir / "head", self.head_hz)
+                        recorder.start(t_motion0)
+                    print(f">>> ⏱ 计时开始(第一条运动指令); 头部相机 {self.head_hz:g}Hz 留档" if recorder
+                          else ">>> ⏱ 计时开始(第一条运动指令)", flush=True)
                 if self.dry_run:
                     if macro % self.chunk_execute == 0:
                         msg = f"    -> 臂0 base pos={np.round(p0,3).tolist()} g={g0:.2f}"
@@ -452,16 +525,23 @@ class EEFRunner:
                     if tgt1 is not None:
                         self.arm1.last_p, self.arm1.last_q = tgt1[0], tgt1[1]
                 macro += 1
+            if self._stop and rec["stop_reason"] is None:
+                rec["stop_reason"] = "q"
         except KeyboardInterrupt:
-            logger.info("Ctrl+C 中断")
+            rec["stop_reason"] = "ctrl-c"
         finally:
+            t_end = time.monotonic()
+            rec["t_end_unix"] = round(time.time(), 3)
+            if t_motion0 is not None:
+                rec["motion_time_s"] = round(t_end - t_motion0, 2)
+            rec["macro_steps"] = macro
+            if recorder is not None:
+                rec["head_frames"] = recorder.stop()
             for _g in self._jguards.values():
                 print(">>> " + _g.summary(), flush=True)
-            self.shutdown()
-
-    def shutdown(self):
-        logger.info("关闭...")
-        try:
+            if ep_dir is not None and self._rec:
+                m, t, st, cw = zip(*self._rec)
+                np.savez(ep_dir / "log.npz", macro=np.array(m), t=np.array(t), state=np.stack(st), actions=np.stack(cw))
             if not self.dry_run:
                 # 停在原地: 切 PLANNING 保持当前位姿, 夹爪张到最大(松开持物)
                 for arm in self._arms():
@@ -474,21 +554,68 @@ class EEFRunner:
                     except Exception:
                         pass
                 print(">>> 已停在原地并张开夹爪。", flush=True)
+        mt = rec["motion_time_s"]
+        print(f">>> 本局结束({rec['stop_reason']}): 用时 {'没动' if mt is None else f'{mt:.1f}s'}, "
+              f"推理 {rec['n_infer']} 次" + (f", 头部留档 {rec.get('head_frames', 0)} 帧" if recorder else ""), flush=True)
+        return rec
+
+    def _end_episode(self, rec):
+        """人工判定(先问人, y/n 必答; x=作废不计入), 进度和备注可空; 追加到 episodes.jsonl。"""
+        while True:
+            v = self.console.ask(">>> 人工判定本局: 成功 y / 失败 n / 作废 x(不计入): ", default="x").lower()
+            if v in ("y", "n", "x"):
+                break
+            print(">>> 请输入 y / n / x", flush=True)
+        rec["human_success"] = {"y": True, "n": False}.get(v)
+        rec["counted"] = v != "x"
+        prog = self.console.ask(">>> 本局任务进度 0-100(回车=不填): ", default="").rstrip("%")
+        try:
+            rec["progress_pct"] = float(prog) if prog and 0.0 <= float(prog) <= 100.0 else None
+        except ValueError:
+            rec["progress_pct"] = None
+        note = self.console.ask(">>> 备注(回车=无): ", default="")
+        if note:
+            rec["note"] = note
+        if self.session_dir is not None:
+            with open(self.session_dir / "episodes.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        print(f">>> 第 {rec['episode']} 局: human_success={rec['human_success']} motion_time_s={rec['motion_time_s']} "
+              f"progress={rec['progress_pct']} counted={rec['counted']}"
+              + (f" -> {self.session_dir / 'episodes.jsonl'}" if self.session_dir else ""), flush=True)
+        return rec
+
+    def _print_summary(self, results):
+        counted = [r for r in results if r.get("counted")]
+        if not results:
+            return
+        ok = sum(1 for r in counted if r.get("human_success"))
+        times = [r["motion_time_s"] for r in counted if r.get("motion_time_s") is not None]
+        sr = f"{ok}/{len(counted)} = {100.0 * ok / len(counted):.0f}%" if counted else "无计入局"
+        print(f"\n>>> 会话小结: 共 {len(results)} 局, 计入 {len(counted)} 局, 成功率 {sr}"
+              + (f", 计入局平均用时 {np.mean(times):.1f}s (中位 {np.median(times):.1f}s)" if times else "")
+              + (f"\n>>> 记录: {self.session_dir}" if self.session_dir else ""), flush=True)
+
+    def _go_home(self):
+        for arm in self._arms():
+            try:
+                arm.h._robot.switch_mode(RobotMode.PLANNING_POS)
+                arm.h.set_joint_positions(list(ZERO_JOINT), blocking=True)
+                print(f">>> [{arm.name}] 已回零点", flush=True)
+            except Exception as e:
+                print(f">>> [{arm.name}] 回零失败: {e}", flush=True)
+
+    def shutdown(self):
+        logger.info("关闭...")
+        try:
+            if not self.dry_run:
                 # 可选回零: 回车=回零; n/Ctrl+C/无stdin = 保持原地
                 do_home = False
                 try:
-                    ans = input(">>> 按【回车】自动回零点, 或输入 n 后回车保持原地: ").strip().lower()
-                    do_home = (ans == "")
-                except (EOFError, KeyboardInterrupt):
+                    do_home = self.console.ask(">>> 按【回车】自动回零点, 或输入 n 后回车保持原地: ", default="n").lower() == ""
+                except KeyboardInterrupt:
                     print("\n>>> 跳过自动回零, 保持原地", flush=True)
                 if do_home:
-                    for arm in self._arms():
-                        try:
-                            arm.h._robot.switch_mode(RobotMode.PLANNING_POS)
-                            arm.h.set_joint_positions(list(ZERO_JOINT), blocking=True)
-                            print(f">>> [{arm.name}] 已回零点", flush=True)
-                        except Exception as e:
-                            print(f">>> [{arm.name}] 回零失败: {e}", flush=True)
+                    self._go_home()
                 else:
                     print(">>> 保持原地; 需要时用 test_play.py 手动归零", flush=True)
             try:
@@ -500,6 +627,93 @@ class EEFRunner:
             logger.error(f"关闭失败: {e}")
         if self.show:
             cv2.destroyAllWindows()
+
+
+class _Console:
+    """stdin 的唯一读者(后台线程 -> 带时间戳的队列): 推理中 'q'/'stop' 当急停键轮询; 局间 ask() 阻塞问答,
+    只接受提示语显示之后敲的行(之前排队的回车/q 一律丢弃)。stdin 关闭(非交互)时 ask() 直接返回 default。"""
+
+    def __init__(self):
+        self._q = queue.Queue()
+        self.eof = False
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            try:
+                line = sys.stdin.readline()
+            except Exception:
+                line = ""
+            if not line:
+                self.eof = True
+                break
+            self._q.put((time.monotonic(), line.rstrip("\n")))
+
+    def stop_requested(self):
+        hit = False
+        while True:
+            try:
+                _, line = self._q.get_nowait()
+            except queue.Empty:
+                return hit
+            if line.strip().lower() in ("q", "stop"):
+                hit = True
+
+    def ask(self, prompt, default=""):
+        t_prompt = time.monotonic()
+        print(prompt, end="", flush=True)
+        while True:
+            try:
+                ts, line = self._q.get(timeout=0.5)
+            except queue.Empty:
+                if self.eof:
+                    print(f"[stdin 已关闭, 取 '{default}']", flush=True)
+                    return default
+                continue
+            if ts >= t_prompt:
+                return line.strip()
+
+
+class _HeadRecorder:
+    """局内头部相机定频留档(默认 2Hz, 原图): head/NNNNN_TTTTT.Ts.jpg(序号_距计时起点秒数) + frames.csv。
+    与推理线程共用相机锁(wait_for_frames 不能两个线程同时对一条 pipeline 调)。"""
+
+    def __init__(self, cams, lock, out_dir, hz):
+        self.cams, self.lock, self.hz = cams, lock, float(hz)
+        self.dir = pathlib.Path(out_dir)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.t0 = None
+        self.n = 0
+        self._stop = threading.Event()
+        self._th = None
+        self._csv = open(self.dir / "frames.csv", "w", encoding="utf-8")
+        self._csv.write("index,unix_time,t_rel_s\n")
+
+    def start(self, t0):
+        self.t0 = t0
+        self._th = threading.Thread(target=self._loop, daemon=True)
+        self._th.start()
+
+    def _loop(self):
+        period = 1.0 / self.hz
+        pipe = self.cams.pipelines.get("head")
+        while not self._stop.is_set():
+            tick = time.monotonic()
+            with self.lock:
+                bgr = self.cams._grab("head", pipe) if pipe is not None else None
+            rel = time.monotonic() - self.t0
+            if bgr is not None:
+                cv2.imwrite(str(self.dir / f"{self.n:05d}_{rel:07.1f}s.jpg"), bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                self._csv.write(f"{self.n},{time.time():.3f},{rel:.2f}\n")
+                self.n += 1
+            self._stop.wait(max(0.0, period - (time.monotonic() - tick)))
+
+    def stop(self):
+        self._stop.set()
+        if self._th is not None:
+            self._th.join(timeout=3.0)
+        self._csv.close()
+        return self.n
 
 
 def main():
@@ -563,6 +777,13 @@ def main():
                     help="关节守卫: 关节距限位 <15° 提示、<5° 报危险(时刻以 macro/10 秒计); 每个 chunk 打印一次臂0关节角; "
                          "结束时打印本次最贴限位的关节。用于核对抽动是否发生在逼近关节限位时")
     ap.add_argument("--no-display", action="store_true")
+    # 会话记录(与 openpi_with_mask_realrobot/local_inference_mask.py 同一布局)
+    ap.add_argument("--head-hz", type=float, default=2.0,
+                    help="局内头部相机留档频率(Hz), 0=不留; 文件在 <会话目录>/epNNN/head/, 可用 ffmpeg 拼视频")
+    ap.add_argument("--no-record", action="store_true", help="不落盘(不建会话目录; 仍会问成败并打印小结)")
+    ap.add_argument("--record", default=None, metavar="DIR",
+                    help="会话目录; 缺省 data/runs/<时间>_<任务>/。内含 session.json, episodes.jsonl(每局成败/用时), "
+                         "epNNN/head/(定频头部原图) epNNN/infer/(每次推理的几路图) epNNN/log.npz")
     args = ap.parse_args()
 
     # board_z: 显式 > auto(读臂0爪的 gripper_params) > 无
