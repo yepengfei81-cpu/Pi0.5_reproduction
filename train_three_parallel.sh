@@ -5,11 +5,14 @@
 #SBATCH --open-mode=append
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:2
-#SBATCH --constraint=h200|h100
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=128G
-#SBATCH --time=20:00:00
+#SBATCH --gres=gpu:1
+#SBATCH --constraint=h200|h100|a100
+# 只要一张 >=80GB 的卡: H200 / H100 80GB / A100 80GB。排除 40GB A100 和 MIG 切片节点(feature 同为 a100 的那台 40GB 必须排);
+# RTX PRO 6000(Blackwell, sm_120) 不能用: 环境是 jax 0.5.3 + CUDA 12.6, 不支持 Blackwell。
+#SBATCH --exclude=holygpu8a25404,holygpu7c0705,holygpu8a29104,holygpu8a[19101-19106,19201-19206,19301-19306,19401-19406,19501-19506,19601-19606,29406,29504-29506,31406,31504-31506]
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=2-00:00:00
 #SBATCH --output=slurm-%j.out
 #
 # 三任务平行爪合集(扫地+擦黑板+挂杯 150 条, three_parallel) 30k 步: 与 hqi 的三任务 mask 模型同数据对照。克隆自 train_single_pair.sh。
@@ -30,7 +33,11 @@ REMAT=()
 if [ "$NGPU" -le 1 ] || ! echo "$GPU_NAME" | grep -qi "H200"; then
     REMAT=(--model.llm-remat-policy nothing_saveable)
 fi
-echo ">>> job $SLURM_JOB_ID: ${NGPU} 卡 / ${GPU_NAME} ($(date)) remat=${REMAT[*]:-config}"
+GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+if [ -n "$GPU_MEM" ] && [ "$GPU_MEM" -lt 70000 ]; then
+    echo "!!! 分到的卡只有 ${GPU_MEM}MiB (<70GB): ${GPU_NAME}, requeue 换一张"; scontrol requeue $SLURM_JOB_ID; sleep 5; exit 0
+fi
+echo ">>> job $SLURM_JOB_ID: ${NGPU} 卡 / ${GPU_NAME} ${GPU_MEM}MiB ($(date)) remat=${REMAT[*]:-config}"
 
 for run in "${RUNS[@]}"; do
     set -- $run; CONFIG=$1; REPO=$2; EXP=$3
